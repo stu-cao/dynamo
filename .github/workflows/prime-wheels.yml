@@ -1,0 +1,211 @@
+name: Prime Wheels
+
+# Builds the Prime Intellect release wheels (ai-dynamo, ai-dynamo-runtime,
+# gpu-memory-service, aisimulate) from this maintenance branch and publishes
+# them as a GitHub Release on this repo.
+#
+# This file only exists on prime/* maintenance branches. It is not part of
+# upstream dynamo and is never submitted upstream.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_suffix:
+        description: 'PEP 440 suffix stamped onto every dynamo version before the build'
+        required: true
+        default: '.dev20260910+prime.1'
+      base_ref:
+        description: 'Upstream commit this branch is pinned to (release notes)'
+        required: true
+        default: '287a8e76881aaf433a376796546ca703f09d96ba'
+      build_timeout_minutes:
+        description: 'Per-arch build timeout in minutes'
+        required: true
+        default: '300'
+
+concurrency:
+  group: prime-wheels-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: wheels (${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ fromJSON(inputs.build_timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/share/swift 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Set up Python for render.py
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install render.py dependencies
+        run: pip install pyyaml jinja2
+
+      - name: Stamp version
+        run: python3 .github/scripts/apply_dev_version.py "${{ inputs.version_suffix }}" .
+
+      - name: Render wheel_builder Dockerfile
+        env:
+          PLATFORM: linux/${{ matrix.arch }}
+        run: |
+          set -euxo pipefail
+          python3 container/render.py \
+            --framework dynamo \
+            --target wheel_builder \
+            --device cuda \
+            --cuda-version 13.0 \
+            --platform "$PLATFORM" \
+            --output-short-filename
+          # CI-only export stage: copies the built wheels out of the
+          # runtime_wheel_builder stage so --output type=local writes just
+          # the wheelhouse instead of the whole manylinux filesystem.
+          cat >> container/rendered.Dockerfile <<'EOF'
+
+          FROM scratch AS wheel_export
+          COPY --from=runtime_wheel_builder /opt/dynamo/dist /dist
+          EOF
+
+      - name: Build wheels
+        run: |
+          set -euxo pipefail
+          docker buildx build \
+            --target wheel_export \
+            --output type=local,dest=wheelout \
+            -f container/rendered.Dockerfile \
+            .
+          ls -la wheelout/dist/
+
+      - name: Collect wheels
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          if [ "$ARCH" = "amd64" ]; then
+            # amd64 job publishes the complete set, including the pure-python
+            # wheels (py3-none-any) that are arch-independent.
+            cp wheelout/dist/*.whl dist/
+          else
+            # arm64 job publishes only arch-specific wheels to avoid
+            # duplicating the pure-python ones under a different filename.
+            cp wheelout/dist/*aarch64*.whl wheelout/dist/*arm64*.whl dist/ 2>/dev/null || true
+            ls dist/
+            test -n "$(ls dist/*.whl)"
+          fi
+          (cd dist && sha256sum *.whl > "SHA256SUMS-$ARCH")
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (full history for release notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: wheels-*
+          merge-multiple: false
+
+      - name: Stage release assets
+        run: |
+          set -euxo pipefail
+          mkdir -p assets
+          find release-assets -name '*.whl' -exec cp {} assets/ \;
+          find release-assets -name 'SHA256SUMS-*' -exec cp {} assets/ \;
+          (cd assets && cat SHA256SUMS-* > SHA256SUMS && rm SHA256SUMS-*)
+          ls -la assets/
+
+      - name: Compute version and notes
+        id: meta
+        env:
+          VERSION_SUFFIX: ${{ inputs.version_suffix }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          set -euxo pipefail
+          BASE=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          VERSION="${BASE}${VERSION_SUFFIX}"
+          TAG="wheels-$(printf '%s' "$VERSION" | tr '+' '-')"
+          NIGHTLY_TAG="nightly-$(printf '%s' "${VERSION_SUFFIX}" | grep -oE 'dev[0-9]+' | sed 's/dev//' || true)"
+          NOTES=$(mktemp -d)
+          {
+            echo "## Prime wheels \`${VERSION}\`"
+            echo
+            echo "Built from \`${GITHUB_SHA}\` on branch \`${GITHUB_REF_NAME}\`."
+            echo
+            echo "Upstream base: nightly \`${NIGHTLY_TAG}\` = \`${BASE_REF}\`."
+            echo
+            echo "### Carried fixes (vs upstream base)"
+            echo '```'
+            git log --format='%h %s (%an)' "${BASE_REF}..HEAD"
+            echo '```'
+            echo
+            echo "### Wheels"
+            echo '```'
+            (cd assets && ls *.whl)
+            echo '```'
+            echo
+            echo "### Install"
+            echo
+            echo '```bash'
+            for w in assets/*.whl; do
+              echo "pip install \"https://github.com/PrimeIntellect-ai/dynamo/releases/download/${TAG}/$(basename "$w")\""
+            done
+            echo '```'
+            echo
+            echo "Verify with \`SHA256SUMS\` from this release."
+          } > "$NOTES/notes.md"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "notes=$NOTES/notes.md" >> "$GITHUB_OUTPUT"
+          cat "$NOTES/notes.md"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          NOTES: ${{ steps.meta.outputs.notes }}
+        run: |
+          set -euxo pipefail
+          gh release create "$TAG" \
+            --target "${GITHUB_SHA}" \
+            --title "Prime wheels ${VERSION}" \
+            --notes-file "$NOTES" \
+            assets/*.whl assets/SHA256SUMS
