@@ -21,8 +21,7 @@ the fixes listed below**.
 |---|---|---|
 | `ec0918bedc` | coalesce duplicate-index entries in streaming chat chunks | [#15054](https://github.com/ai-dynamo/dynamo/pull/15054) (open) |
 | `2c8d6649ba` | normalize before glm47 recovery, never fold unmergeable chunks | [#15054](https://github.com/ai-dynamo/dynamo/pull/15054) (open) |
-| `84367bc503` | accept `max` reasoning effort on the Responses API | not yet submitted |
-| `6161a36c58` | preserve worker errors when local stop conditions trigger | [#15094](https://github.com/ai-dynamo/dynamo/pull/15094) (open) |
+| `cde7d5c5df` | preserve worker errors when local stop conditions trigger | [#15094](https://github.com/ai-dynamo/dynamo/pull/15094) (open) |
 
 Notes:
 
@@ -33,6 +32,18 @@ Notes:
   as the upstream patch comment prescribes.
 - When an upstream PR merges, re-pin to a nightly that contains it and drop the
   carried commit (see below).
+
+### Not carried on purpose: `max` reasoning effort
+
+The Responses API `max` reasoning effort is fixed in the crate chain, not in
+dynamo: async-openai
+[#573](https://github.com/64bit/async-openai/pull/573) (merged) adds the enum
+variant, [frontend-crates
+#258](https://github.com/ai-dynamo/frontend-crates/pull/258) bumps
+`dynamo-protocols` to async-openai 0.42, and dynamo picks it up via its
+`dynamo-protocols` (workspace, from crates.io) pin. Do NOT carry a vendored
+lib/llm patch for this on prime branches; wait for the crate bump to reach an
+upstream nightly and re-pin instead.
 
 ## Versioning
 
