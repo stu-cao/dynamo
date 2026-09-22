@@ -2320,6 +2320,96 @@ async fn test_glm47_streaming_prose_plus_truncated_block_tail_already_emitted() 
     );
 }
 
+fn finish_reasons(chunks: &[Annotated<NvCreateChatCompletionStreamResponse>]) -> Vec<FinishReason> {
+    chunks
+        .iter()
+        .filter_map(|a| a.data.as_ref())
+        .flat_map(|d| d.inner.choices.iter())
+        .filter_map(|c| c.finish_reason)
+        .collect()
+}
+
+fn tool_call_count(chunks: &[Annotated<NvCreateChatCompletionStreamResponse>]) -> usize {
+    chunks
+        .iter()
+        .filter_map(|a| a.data.as_ref())
+        .flat_map(|d| d.inner.choices.iter())
+        .filter_map(|c| c.delta.tool_calls.as_ref())
+        .map(|calls| calls.len())
+        .sum()
+}
+
+// EOS right after the start marker: the jail drops the incomplete block, so a plain
+// stop would tell the client the turn ended cleanly with no call.
+#[tokio::test]
+async fn test_glm47_streaming_stop_after_bare_marker_reports_length() {
+    let chunks = vec![
+        make_glm47_chunk(Some("I'll check. "), None),
+        make_glm47_chunk(Some("<tool_call>"), Some(FinishReason::Stop)),
+    ];
+    let out = run_glm47_jail(chunks).await;
+
+    assert_eq!(finish_reasons(&out), vec![FinishReason::Length]);
+    assert_eq!(tool_call_count(&out), 0);
+}
+
+#[tokio::test]
+async fn test_glm47_streaming_stop_after_partial_function_name_reports_length() {
+    let chunks = vec![make_glm47_chunk(
+        Some("I'll check. <tool_call>ipy"),
+        Some(FinishReason::Stop),
+    )];
+    let out = run_glm47_jail(chunks).await;
+
+    assert_eq!(finish_reasons(&out), vec![FinishReason::Length]);
+    assert_eq!(tool_call_count(&out), 0);
+}
+
+// Partial arguments may be salvaged into a call by the parser's EOF recovery; either way
+// the client must not see a plain stop with no call.
+#[tokio::test]
+async fn test_glm47_streaming_stop_after_partial_arguments_is_not_a_silent_stop() {
+    let chunks = vec![make_glm47_chunk(
+        Some("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par"),
+        Some(FinishReason::Stop),
+    )];
+    let out = run_glm47_jail(chunks).await;
+
+    assert!(
+        tool_call_count(&out) > 0 || finish_reasons(&out) == vec![FinishReason::Length],
+        "got finish={:?} calls={}",
+        finish_reasons(&out),
+        tool_call_count(&out)
+    );
+}
+
+#[tokio::test]
+async fn test_glm47_streaming_stop_without_marker_keeps_stop() {
+    let chunks = vec![
+        make_glm47_chunk(Some("Done. "), None),
+        make_glm47_chunk(Some("The worker exited normally."), Some(FinishReason::Stop)),
+    ];
+    let out = run_glm47_jail(chunks).await;
+
+    assert_eq!(finish_reasons(&out), vec![FinishReason::Stop]);
+    assert_eq!(
+        content_texts(&out).concat(),
+        "Done. The worker exited normally."
+    );
+}
+
+#[tokio::test]
+async fn test_glm47_streaming_complete_call_on_stop_keeps_tool_calls() {
+    let chunks = vec![make_glm47_chunk(
+        Some("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>"),
+        Some(FinishReason::Stop),
+    )];
+    let out = run_glm47_jail(chunks).await;
+
+    assert_eq!(tool_call_count(&out), 1);
+    assert!(!finish_reasons(&out).contains(&FinishReason::Length));
+}
+
 // CJK chars are 3 bytes each in UTF-8. If a multi-byte char straddles the
 // keep_from boundary the drain() call would panic without the is_char_boundary
 // walk-back. This test verifies the walk-back prevents that panic on ordinary

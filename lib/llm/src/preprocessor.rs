@@ -5633,6 +5633,37 @@ impl OpenAIPreprocessor {
                 Self::coalesce_duplicate_stream_indices(&mut data.inner);
             }
 
+            // An EOS inside a tool call is incomplete even if the engine reports stop.
+            // Report it as length so the recovery pass below treats it as truncation.
+            if is_glm47 && let Some(data) = &mut nv_chunk.data {
+                let cr = choice_recovery.lock().expect("choice recovery poisoned");
+                for choice in &mut data.inner.choices {
+                    let Some(state) = cr.get(&choice.index) else {
+                        continue;
+                    };
+                    let dropped_call = choice.finish_reason
+                        == Some(dynamo_protocols::types::FinishReason::Stop)
+                        && !state.emitted_tool_call
+                        && choice
+                            .delta
+                            .tool_calls
+                            .as_ref()
+                            .is_none_or(|calls| calls.is_empty())
+                        && state
+                            .input_text
+                            .rfind(glm47_start.as_str())
+                            .is_some_and(|pos| !state.input_text[pos..].contains(glm47_end.as_str()));
+                    if dropped_call {
+                        tracing::warn!(
+                            choice_index = choice.index,
+                            why = "dropped_native_tool_call_reported_as_length",
+                            "glm47 streaming: reporting length instead of stop for a tool call dropped at end of stream"
+                        );
+                        choice.finish_reason = Some(dynamo_protocols::types::FinishReason::Length);
+                    }
+                }
+            }
+
             // glm47: on finish_reason=length, recover the last incomplete
             // <tool_call> block. rfind skips complete blocks so earlier parsed
             // calls are never duplicated. Recovered content WILL contain raw
