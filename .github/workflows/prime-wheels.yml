@@ -88,10 +88,15 @@ jobs:
           EOF
 
       - name: Build wheels
+        env:
+          # Token with read access to PrimeIntellect-ai/frontend-crates and
+          # PrimeIntellect-ai/async-openai (the [patch.crates-io] git sources).
+          PRIME_FORK_TOKEN: ${{ secrets.DYNAMO_SOURCE_TOKEN }}
         run: |
           set -euxo pipefail
           docker buildx build \
             --target wheel_export \
+            --secret id=prime-fork-token,env=PRIME_FORK_TOKEN \
             --output type=local,dest=wheelout \
             -f container/rendered.Dockerfile \
             .
