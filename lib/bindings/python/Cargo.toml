@@ -138,3 +138,17 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 inherits = "release"
 debug = true
 strip = false
+
+# MUST mirror the root Cargo.toml's [patch.crates-io] verbatim.
+#
+# This crate declares its own [workspace] (pyo3 build constraint), so it is a
+# separate workspace root and does NOT inherit the root's patch table. maturin
+# builds THIS manifest, so a patch present only in the root is silently ignored
+# and the wheel links the unpatched crates.io versions -- a wheel that builds,
+# installs, imports and passes the version gate while behaving like stock.
+#
+# `prime-wheels.yml` fails the build if this block drifts from the root.
+[patch.crates-io]
+dynamo-protocols = { git = "https://github.com/PrimeIntellect-ai/frontend-crates.git", branch = "prime/fleet-5.4.1-8.1.0" }
+dynamo-parsers = { git = "https://github.com/PrimeIntellect-ai/frontend-crates.git", branch = "prime/fleet-5.4.1-8.1.0" }
+async-openai = { git = "https://github.com/PrimeIntellect-ai/async-openai.git", branch = "prime/0.41-max" }
