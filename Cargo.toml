@@ -218,3 +218,29 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+
+# Prime carry: override the two crates the fleet pins with Prime maintenance
+# lines carrying fixes that upstream dynamo has not absorbed yet. Sources
+# declare exactly the pinned versions (=5.4.1 / 8.1.0), so NO pin bumps and
+# no API drift: the nightly code compiles unchanged.
+#   - dynamo-protocols 5.4.1: Responses API `max` reasoning effort
+#     (64bit/async-openai#573), delivered by patching async-openai 0.41.1 with
+#     the one-line variant via prime/0.41-max instead of the API-breaking 0.42,
+#     backported at prime/protocols-5.4.1.
+#   - dynamo-parsers 8.1.0 + glm47 EOF-truncation recovery
+#     (ai-dynamo/frontend-crates fix/glm47-eof-recovery-at-truncation),
+#     backported at prime/parsers-8.1.0.
+# Single source, one rev: the fleet snapshot branch declares BOTH crates at
+# exactly the pinned versions, so the graph resolves one copy of each.
+#   - dynamo-protocols 5.4.1: Responses API `max` reasoning effort
+#     (64bit/async-openai#573), delivered by patching async-openai 0.41.1 with
+#     the one-line variant via prime/0.41-max instead of the API-breaking 0.42
+#   - dynamo-parsers 8.1.0 + glm47 EOF-truncation recovery
+#     (fix/glm47-eof-recovery-at-truncation)
+# Cargo.lock pins the resolved rev. Drop this section when an upstream
+# nightly pins released crates containing both fixes.
+[patch.crates-io]
+dynamo-protocols = { git = "https://github.com/PrimeIntellect-ai/frontend-crates.git", branch = "prime/fleet-5.4.1-8.1.0" }
+dynamo-parsers = { git = "https://github.com/PrimeIntellect-ai/frontend-crates.git", branch = "prime/fleet-5.4.1-8.1.0" }
+async-openai = { git = "https://github.com/PrimeIntellect-ai/async-openai.git", branch = "prime/0.41-max" }
