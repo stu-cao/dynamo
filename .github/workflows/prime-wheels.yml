@@ -11,9 +11,13 @@ on:
   workflow_dispatch:
     inputs:
       version_suffix:
-        description: 'PEP 440 suffix stamped onto every dynamo version before the build'
-        required: true
-        default: '.dev20260910+prime.1'
+        description: >-
+          PEP 440 suffix override. Leave EMPTY (recommended): the suffix is then
+          derived from the commit being built as .dev20260910+prime.g<short-sha>,
+          so every wheel names its own source instead of a hand-typed counter.
+          Set it only to reproduce an older hand-numbered build.
+        required: false
+        default: ''
       base_ref:
         description: 'Upstream commit this branch is pinned to (release notes)'
         required: true
@@ -63,8 +67,20 @@ jobs:
       - name: Install render.py dependencies
         run: pip install pyyaml jinja2
 
+      # GITHUB_SHA is identical across jobs, so the build and release jobs
+      # derive the same suffix without coordinating or re-running git.
+      - name: Compute version suffix
+        id: version
+        env:
+          OVERRIDE: ${{ inputs.version_suffix }}
+        run: |
+          set -euo pipefail
+          SUFFIX="${OVERRIDE:-.dev20260910+prime.g${GITHUB_SHA:0:10}}"
+          echo "suffix=$SUFFIX" >> "$GITHUB_OUTPUT"
+          echo "version suffix: $SUFFIX"
+
       - name: Stamp version
-        run: python3 .github/scripts/apply_dev_version.py "${{ inputs.version_suffix }}" .
+        run: python3 .github/scripts/apply_dev_version.py "${{ steps.version.outputs.suffix }}" .
 
       # maturin builds lib/bindings/python/Cargo.toml, which declares its own
       # [workspace] and therefore does NOT inherit the root's [patch.crates-io].
@@ -168,10 +184,12 @@ jobs:
       - name: Compute version and notes
         id: meta
         env:
-          VERSION_SUFFIX: ${{ inputs.version_suffix }}
+          VERSION_SUFFIX_OVERRIDE: ${{ inputs.version_suffix }}
           BASE_REF: ${{ inputs.base_ref }}
         run: |
           set -euxo pipefail
+          # Must match the build job's derivation exactly.
+          VERSION_SUFFIX="${VERSION_SUFFIX_OVERRIDE:-.dev20260910+prime.g${GITHUB_SHA:0:10}}"
           BASE=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
           VERSION="${BASE}${VERSION_SUFFIX}"
           TAG="wheels-$(printf '%s' "$VERSION" | tr '+' '-')"
