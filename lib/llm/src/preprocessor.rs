@@ -5427,6 +5427,11 @@ impl OpenAIPreprocessor {
             input_text: String,
             emitted_text: String,
             recovered: bool,
+            // Set once the jail emits a tool call for this choice. The jail's
+            // finalize can salvage a truncated <tool_call> into a real call
+            // (glm47 EOF recovery in dynamo-parsers), and when it does, the raw
+            // markup must NOT also be released as content below.
+            emitted_tool_call: bool,
         }
         // Named so the bool in the recoveries tuple is legible at each use site.
         struct PendingRecovery {
@@ -5673,7 +5678,22 @@ impl OpenAIPreprocessor {
                             }
                             state.emitted_text.drain(..keep_from);
                         }
+                        // Observed on every chunk, so a call arriving in the same
+                        // chunk as finish_reason is seen before the gate below.
+                        if choice
+                            .delta
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|calls| !calls.is_empty())
+                        {
+                            state.emitted_tool_call = true;
+                        }
+                        // Releasing the markup as content is a fallback for a
+                        // truncated block that produced NO call. Doing it anyway
+                        // hands the caller raw <tool_call> wire tags next to a tool
+                        // call it is already executing.
                         if state.recovered
+                            || state.emitted_tool_call
                             || !matches!(
                                 choice.finish_reason,
                                 Some(dynamo_protocols::types::FinishReason::Length)
