@@ -66,6 +66,14 @@ jobs:
       - name: Stamp version
         run: python3 .github/scripts/apply_dev_version.py "${{ inputs.version_suffix }}" .
 
+      # maturin builds lib/bindings/python/Cargo.toml, which declares its own
+      # [workspace] and therefore does NOT inherit the root's [patch.crates-io].
+      # A patch present only in the root is silently ignored: the wheel links the
+      # unpatched crates.io versions and still builds, installs, imports and
+      # passes the version gate. Fail here rather than publish a hollow wheel.
+      - name: Verify [patch.crates-io] is mirrored into the bindings workspace
+        run: python3 .github/scripts/check_patch_sync.py
+
       - name: Render wheel_builder Dockerfile
         env:
           PLATFORM: linux/${{ matrix.arch }}
