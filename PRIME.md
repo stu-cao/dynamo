@@ -23,6 +23,8 @@ the fixes listed below**.
 | `2c8d6649ba` | normalize before glm47 recovery, never fold unmergeable chunks | [#15054](https://github.com/ai-dynamo/dynamo/pull/15054) (open) |
 | `cde7d5c5df` | preserve worker errors when local stop conditions trigger | [#15094](https://github.com/ai-dynamo/dynamo/pull/15094) (open) |
 | `5f278c0f4c` | pin `dynamo-parsers` to frontend-crates `prime/fleet-5.4.1-8.1.0` @ `c0ad1bb1c0`: glm47 keeps scalar types for nullable/union params | frontend-crates [#280](https://github.com/ai-dynamo/frontend-crates/pull/280) (open), [#215](https://github.com/ai-dynamo/frontend-crates/pull/215) (merged) |
+| `07b5f8e829` | report glm47 calls dropped at EOS (stop inside an unterminated `<tool_call>`) as length | [#15184](https://github.com/ai-dynamo/dynamo/pull/15184) (open) |
+| `ab7c710665` | pin `dynamo-parsers` to frontend-crates `prime/fleet-5.4.1-8.1.0` @ `e942d8cd0e`: glm47 returns calls to tools not in the request | frontend-crates [#263](https://github.com/ai-dynamo/frontend-crates/pull/263) (open) |
 
 Notes:
 
@@ -31,6 +33,10 @@ Notes:
   (`PendingRecovery` -> `ChoiceRecovery`, PR #13792). The ported version keeps
   the nightly's `PendingRecovery` pass and moves the coalesce call before it,
   as the upstream patch comment prescribes.
+- `07b5f8e829` is hand-ported too: upstream relabels inside `main`'s refactored
+  suppression block; here the relabel runs just before the nightly's
+  `PendingRecovery` pass, so a call dropped at EOS takes the same length path as
+  max-token truncation.
 - When an upstream PR merges, re-pin to a nightly that contains it and drop the
   carried commit (see below).
 
