@@ -22,6 +22,7 @@ the fixes listed below**.
 | `ec0918bedc` | coalesce duplicate-index entries in streaming chat chunks | [#15054](https://github.com/ai-dynamo/dynamo/pull/15054) (open) |
 | `2c8d6649ba` | normalize before glm47 recovery, never fold unmergeable chunks | [#15054](https://github.com/ai-dynamo/dynamo/pull/15054) (open) |
 | `cde7d5c5df` | preserve worker errors when local stop conditions trigger | [#15094](https://github.com/ai-dynamo/dynamo/pull/15094) (open) |
+| `5f278c0f4c` | pin `dynamo-parsers` to frontend-crates `prime/fleet-5.4.1-8.1.0` @ `c0ad1bb1c0`: glm47 keeps scalar types for nullable/union params | frontend-crates [#280](https://github.com/ai-dynamo/frontend-crates/pull/280) (open), [#215](https://github.com/ai-dynamo/frontend-crates/pull/215) (merged) |
 
 Notes:
 
