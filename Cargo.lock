@@ -2840,7 +2840,7 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers"
 version = "8.1.0"
-source = "git+https://github.com/PrimeIntellect-ai/frontend-crates.git?branch=prime%2Ffleet-5.4.1-8.1.0#26de6a76e01ad44958990fa8033a86d49fc4927b"
+source = "git+https://github.com/PrimeIntellect-ai/frontend-crates.git?branch=prime%2Ffleet-5.4.1-8.1.0#8cbe14df6a5d206a39b17cb22d302896b4233596"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2879,7 +2879,7 @@ dependencies = [
 [[package]]
 name = "dynamo-protocols"
 version = "5.4.1"
-source = "git+https://github.com/PrimeIntellect-ai/frontend-crates.git?branch=prime%2Ffleet-5.4.1-8.1.0#26de6a76e01ad44958990fa8033a86d49fc4927b"
+source = "git+https://github.com/PrimeIntellect-ai/frontend-crates.git?branch=prime%2Ffleet-5.4.1-8.1.0#8cbe14df6a5d206a39b17cb22d302896b4233596"
 dependencies = [
  "async-openai",
  "derive_builder",
