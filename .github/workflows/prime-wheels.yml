@@ -45,22 +45,39 @@ permissions:
   contents: write
 
 jobs:
+  # Emits the build matrix as JSON. A `matrix.exclude` cannot be used to filter
+  # an include-only matrix -- exclude is applied to the base combinations, and
+  # with no base keys it resolved to zero jobs. Building the list here is the
+  # supported way to make the arch set dynamic.
+  matrix:
+    name: resolve matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - id: build
+        env:
+          ARCHES: ${{ inputs.arches }}
+        run: |
+          set -euo pipefail
+          AMD='{"arch":"amd64","runs-on":"ubuntu-latest"}'
+          ARM='{"arch":"arm64","runs-on":"ubuntu-24.04-arm"}'
+          case "$ARCHES" in
+            amd64) M="{\"include\":[$AMD]}" ;;
+            arm64) M="{\"include\":[$ARM]}" ;;
+            *)     M="{\"include\":[$AMD,$ARM]}" ;;
+          esac
+          echo "matrix=$M" >> "$GITHUB_OUTPUT"
+          echo "resolved arches=$ARCHES -> $M"
+
   build:
     name: wheels (${{ matrix.arch }})
+    needs: matrix
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: ${{ fromJSON(inputs.build_timeout_minutes) }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runs-on: ubuntu-latest
-          - arch: arm64
-            runs-on: ubuntu-24.04-arm
-        # `arches` picks which of the two actually run. Written as an exclude so
-        # the include list above stays the single source of arch -> runner.
-        exclude:
-          - arch: ${{ inputs.arches == 'amd64' && 'arm64' || (inputs.arches == 'arm64' && 'amd64' || 'none') }}
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
     steps:
       - name: Free disk space
         run: |
