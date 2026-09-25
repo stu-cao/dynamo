@@ -26,6 +26,16 @@ on:
         description: 'Per-arch build timeout in minutes'
         required: true
         default: '300'
+      runner:
+        description: >-
+          Runner label for the build jobs. ubuntu-latest (default) is GitHub's
+          free tier -- 4 vCPU, which is why a full compile takes ~70 min. Set a
+          self-hosted label to use a bigger machine; if that label is not
+          visible to THIS repo the job queues instead of failing, so watch that
+          it actually starts and cancel if it does not.
+        required: true
+        type: string
+        default: 'ubuntu-latest'
       arches:
         description: >-
           Which architectures to build. "both" is the release default. Pick a
@@ -58,9 +68,11 @@ jobs:
       - id: build
         env:
           ARCHES: ${{ inputs.arches }}
+          RUNNER_LABEL: ${{ inputs.runner }}
         run: |
           set -euo pipefail
-          AMD='{"arch":"amd64","runs-on":"ubuntu-latest"}'
+          # amd64 honours the runner input; arm64 has no self-hosted equivalent.
+          AMD="{\"arch\":\"amd64\",\"runs-on\":\"${RUNNER_LABEL}\"}"
           ARM='{"arch":"arm64","runs-on":"ubuntu-24.04-arm"}'
           case "$ARCHES" in
             amd64) M="{\"include\":[$AMD]}" ;;
