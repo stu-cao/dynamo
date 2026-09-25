@@ -26,6 +26,16 @@ on:
         description: 'Per-arch build timeout in minutes'
         required: true
         default: '300'
+      arches:
+        description: >-
+          Which architectures to build. "both" is the release default. Pick a
+          single arch for an urgent build: the frontends on both fleets are
+          x86_64, so amd64 alone is enough to ship a router wheel and it takes
+          arm64 off the critical path.
+        required: true
+        type: choice
+        default: 'both'
+        options: ['both', 'amd64', 'arm64']
 
 concurrency:
   group: prime-wheels-${{ github.ref }}
@@ -47,6 +57,10 @@ jobs:
             runs-on: ubuntu-latest
           - arch: arm64
             runs-on: ubuntu-24.04-arm
+        # `arches` picks which of the two actually run. Written as an exclude so
+        # the include list above stays the single source of arch -> runner.
+        exclude:
+          - arch: ${{ inputs.arches == 'amd64' && 'arm64' || (inputs.arches == 'arm64' && 'amd64' || 'none') }}
     steps:
       - name: Free disk space
         run: |
@@ -58,6 +72,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: false
+
+      # Required for --cache-to/--cache-from type=gha. The default `docker`
+      # driver cannot export a build cache, so without this step the cache
+      # flags below are accepted and silently do nothing.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Set up Python for render.py
         uses: actions/setup-python@v5
@@ -116,10 +136,16 @@ jobs:
           # Token with read access to PrimeIntellect-ai/frontend-crates and
           # PrimeIntellect-ai/async-openai (the [patch.crates-io] git sources).
           PRIME_FORK_TOKEN: ${{ secrets.DYNAMO_SOURCE_TOKEN }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euxo pipefail
+          # Cache scope is per-arch: the two produce different layers, and a
+          # shared scope makes them evict each other on every run. mode=max
+          # keeps intermediate stages, which is where the cargo build lives.
           docker buildx build \
             --target wheel_export \
+            --cache-from "type=gha,scope=prime-wheels-${ARCH}" \
+            --cache-to "type=gha,scope=prime-wheels-${ARCH},mode=max" \
             --secret id=prime-fork-token,env=PRIME_FORK_TOKEN \
             --output type=local,dest=wheelout \
             -f container/rendered.Dockerfile \
