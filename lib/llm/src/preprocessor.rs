@@ -1831,6 +1831,42 @@ impl OpenAIPreprocessor {
         }
     }
 
+    /// Public aliases that switch reasoning on or off. `normalize_thinking_aliases`
+    /// rewrites every spelling into these three keys before forwarding.
+    const THINKING_TOGGLE_KEYS: [&'static str; 3] = ["thinking", "enable_thinking", "thinking_mode"];
+
+    /// Remove the thinking on/off aliases from the `chat_template_kwargs` forwarded
+    /// to the engine's reasoning parser (`reasoning_parser_kwargs`), keeping every
+    /// other template argument (e.g. `reasoning_effort`). Drops the container when
+    /// nothing else remains. Returns whether anything was removed.
+    ///
+    /// Used when the rendered prompt provably ignored those aliases (it still ends
+    /// with the reasoning opener), so the engine-side parser and the frontend's
+    /// response parser agree that generation starts inside reasoning.
+    fn strip_ignored_thinking_kwargs(extra_args: &mut serde_json::Value) -> bool {
+        let Some(root) = extra_args.as_object_mut() else {
+            return false;
+        };
+        let Some(kwargs) = root
+            .get_mut("reasoning_parser_kwargs")
+            .and_then(|v| v.get_mut("chat_template_kwargs"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return false;
+        };
+        let mut removed = false;
+        for key in Self::THINKING_TOGGLE_KEYS {
+            removed |= kwargs.remove(key).is_some();
+        }
+        if !removed {
+            return false;
+        }
+        if kwargs.is_empty() {
+            root.remove("reasoning_parser_kwargs");
+        }
+        true
+    }
+
     fn has_request_thinking_control(
         chat_template_args: Option<&HashMap<String, serde_json::Value>>,
     ) -> bool {
@@ -2711,6 +2747,22 @@ impl OpenAIPreprocessor {
                 .as_object_mut()
                 .context("preprocessed extra_args must be an object")?;
             extra_args.insert("reasoning_ended".to_string(), reasoning_ended.into());
+        }
+
+        // The chat template already opened the reasoning block, so any per-request
+        // "thinking off" alias was ignored by the prompt. Do not let it reach the
+        // engine's reasoning parser either: vLLM would start that parser in content
+        // mode, open its structured-output gate at token 0, and the response parser
+        // here (which follows the prompt) would then file the forced tool call under
+        // reasoning_content. Forward only what the prompt actually honoured.
+        if prompt_injected_reasoning
+            && let Some(extra_args) = preprocessed.extra_args.as_mut()
+            && Self::strip_ignored_thinking_kwargs(extra_args)
+        {
+            tracing::debug!(
+                "Dropped thinking-toggle chat_template_kwargs from reasoning_parser_kwargs: \
+                 the rendered prompt already starts a reasoning block"
+            );
         }
 
         // If omitted, allow generation up to the remaining context length. Responses requests
@@ -9607,6 +9659,53 @@ mod tests {
                 })
             );
             assert_eq!(extra_args["reasoning_ended"], false);
+        }
+    }
+
+    /// A prompt-injected reasoning block means the template ignored the request's
+    /// thinking toggles; they must not reach the engine's reasoning parser, while
+    /// every other template argument still does.
+    #[test]
+    fn test_strip_ignored_thinking_kwargs_keeps_effort_drops_toggles() {
+        let mut extra_args = serde_json::json!({
+            "reasoning_parser_kwargs": {"chat_template_kwargs": {
+                "thinking": false, "enable_thinking": false, "thinking_mode": "disabled",
+                "reasoning_effort": "low", "clear_thinking": true
+            }},
+            "reasoning_ended": false
+        });
+        assert!(OpenAIPreprocessor::strip_ignored_thinking_kwargs(&mut extra_args));
+        assert_eq!(
+            extra_args,
+            serde_json::json!({
+                "reasoning_parser_kwargs": {"chat_template_kwargs": {
+                    "reasoning_effort": "low", "clear_thinking": true
+                }},
+                "reasoning_ended": false
+            })
+        );
+    }
+
+    #[test]
+    fn test_strip_ignored_thinking_kwargs_drops_empty_container() {
+        let mut extra_args = serde_json::json!({
+            "reasoning_parser_kwargs": {"chat_template_kwargs": {"thinking_mode": "disabled"}},
+            "nvext": {"x": 1}
+        });
+        assert!(OpenAIPreprocessor::strip_ignored_thinking_kwargs(&mut extra_args));
+        assert_eq!(extra_args, serde_json::json!({"nvext": {"x": 1}}));
+    }
+
+    #[test]
+    fn test_strip_ignored_thinking_kwargs_is_a_noop_without_toggles() {
+        for value in [
+            serde_json::json!({"reasoning_parser_kwargs": {"chat_template_kwargs": {"reasoning_effort": "high"}}}),
+            serde_json::json!({"nvext": {"x": 1}}),
+            serde_json::json!(null),
+        ] {
+            let mut extra_args = value.clone();
+            assert!(!OpenAIPreprocessor::strip_ignored_thinking_kwargs(&mut extra_args));
+            assert_eq!(extra_args, value);
         }
     }
 
