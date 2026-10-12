@@ -570,6 +570,9 @@ COPY .cargo/ /opt/dynamo/.cargo/
 COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
 COPY lib/ /opt/dynamo/lib/
 COPY components/ /opt/dynamo/components/
+# The DeepSeek-V4.1 runtime patches dynamo-parsers / dynamo-parsers-v2 from
+# vendored path crates ([patch.crates-io] in Cargo.toml and the bindings).
+COPY vendor/ /opt/dynamo/vendor/
 
 # Build ai-dynamo (pure Python) and ai-dynamo-runtime (maturin) wheels
 ARG USE_SCCACHE
@@ -840,6 +843,9 @@ COPY .cargo/ /opt/dynamo/.cargo/
 COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
 COPY lib/ /opt/dynamo/lib/
 COPY components/ /opt/dynamo/components/
+# The DeepSeek-V4.1 runtime patches dynamo-parsers / dynamo-parsers-v2 from
+# vendored path crates ([patch.crates-io] in Cargo.toml and the bindings).
+COPY vendor/ /opt/dynamo/vendor/
 
 # Build kvbm wheel (with nixl linkage via auditwheel repair)
 ARG ENABLE_KVBM
