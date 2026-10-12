@@ -2298,7 +2298,25 @@ pub fn process_response_using_event_converter_and_observe_metrics<T: Serialize>(
         annotated.data = None;
     }
 
+    strip_router_marker_frame(&mut annotated);
+
     annotated_to_sse_event(annotated)
+}
+
+/// Drop router-internal marker frames before they reach the client.
+///
+/// Conditional disagg prepends a data-less `x-bypass-remote-prefill` annotation to
+/// the response stream when it routes a request straight to decode. Forwarded as-is
+/// it becomes a named SSE event with an empty data field, which is not part of the
+/// OpenAI stream format and makes the OpenAI SDKs fail to parse the stream.
+fn strip_router_marker_frame<T>(annotated: &mut crate::types::Annotated<T>) {
+    if annotated.event.as_deref()
+        == Some(crate::kv_router::prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION)
+    {
+        annotated.event = None;
+        annotated.comment = None;
+        annotated.data = None;
+    }
 }
 
 /// Process chat-derived streaming responses with typed metrics before SSE conversion.
@@ -2336,6 +2354,8 @@ pub fn process_chat_response_using_event_converter_and_observe_metrics(
         annotated.comment = None;
         annotated.data = None;
     }
+
+    strip_router_marker_frame(&mut annotated);
 
     // Route reasoning at the SSE boundary. Internal representation stays
     // `reasoning_content`.
@@ -3449,6 +3469,47 @@ mod tests {
             result.is_none(),
             "payload_usage chunk must not be forwarded to the client SSE stream"
         );
+    }
+
+    #[test]
+    fn bypass_remote_prefill_marker_not_forwarded_to_client_sse() {
+        // Conditional disagg prepends a data-less marker frame to the response
+        // stream. It must be dropped on both SSE paths, not sent as a named event.
+        use crate::kv_router::prefill_router::BYPASS_REMOTE_PREFILL_ANNOTATION;
+        use crate::types::Annotated;
+
+        let metrics = Arc::new(Metrics::new());
+        let registry = prometheus::Registry::new();
+        metrics.register(&registry).unwrap();
+        let mut collector = metrics.clone().create_response_collector("test-model");
+
+        let marker = Annotated::<
+            crate::protocols::openai::chat_completions::NvCreateChatCompletionStreamResponse,
+        >::from_annotation(BYPASS_REMOTE_PREFILL_ANNOTATION, &true)
+        .unwrap();
+        let mut http_queue_guard = None;
+        let result = process_chat_response_using_event_converter_and_observe_metrics(
+            EventConverter::from(marker),
+            &mut collector,
+            &mut http_queue_guard,
+            ReasoningField::default(),
+        )
+        .expect("conversion ok");
+        assert!(result.is_none(), "chat stream forwarded the bypass marker");
+
+        let marker = Annotated::<serde_json::Value>::from_annotation(
+            BYPASS_REMOTE_PREFILL_ANNOTATION,
+            &true,
+        )
+        .unwrap();
+        let mut http_queue_guard = None;
+        let result = process_response_using_event_converter_and_observe_metrics(
+            EventConverter::from(marker),
+            &mut collector,
+            &mut http_queue_guard,
+        )
+        .expect("conversion ok");
+        assert!(result.is_none(), "completions stream forwarded the bypass marker");
     }
 
     #[test]
