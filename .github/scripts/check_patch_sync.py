@@ -11,6 +11,8 @@ import pathlib
 import re
 import sys
 
+PATH_SPEC_RE = re.compile(r'\{ path = "([^"]+)" \}')
+REPO = pathlib.Path.cwd().resolve()
 PATCH_RE = re.compile(r"^\[patch\.crates-io\]\n(?:.*\n)*?(?=\n*\[|\Z)", re.M)
 
 
@@ -24,7 +26,14 @@ def section(path: pathlib.Path) -> dict[str, str] | None:
         if not line:
             continue
         name, _, spec = line.partition("=")
-        entries[name.strip()] = " ".join(spec.split())
+        spec = " ".join(spec.split())
+        # A `path =` source is relative to its own manifest, so the root and the
+        # bindings manifest spell the same vendored crate differently. Compare
+        # the directory it resolves to, not the string.
+        pm = PATH_SPEC_RE.fullmatch(spec)
+        if pm:
+            spec = "{ path = %s }" % (path.parent / pm.group(1)).resolve().relative_to(REPO)
+        entries[name.strip()] = spec
     return entries
 
 
