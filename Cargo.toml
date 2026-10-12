@@ -3,6 +3,8 @@
 
 [workspace]
 members = [
+    "vendor/dynamo-parsers",
+    "vendor/dynamo-parsers-v2",
     "lib/llm",
     "lib/rl",
     "lib/runtime",
@@ -62,8 +64,8 @@ aisimulate-core = { version = "=0.1.0-dev.2" }
 dynamo-runtime = { path = "lib/runtime", version = "1.5.0" }
 dynamo-llm = { path = "lib/llm", version = "1.5.0" }
 dynamo-rl = { path = "lib/rl", version = "1.5.0" }
-dynamo-tokenizers = { version = "=1.8.0" }
-dynamo-renderer = { version = "=5.1.0" }
+dynamo-tokenizers = { version = "=1.8.1" }
+dynamo-renderer = { version = "=5.2.0" }
 dynamo-tokens = { path = "lib/tokens", version = "1.5.0" }
 dynamo-truthy = { path = "lib/truthy", version = "1.5.0" }
 dynamo-data-gen = { path = "lib/data-gen", version = "1.5.0" }
@@ -71,13 +73,13 @@ dynamo-kv-hashing = { path = "lib/kv-hashing", version = "1.5.0" }
 dynamo-memory = { path = "lib/memory", version = "1.5.0" }
 dynamo-mocker = { path = "lib/mocker", version = "1.5.0" }
 dynamo-kv-router = { path = "lib/kv-router", version = "1.5.0" }
-dynamo-protocols = { version = "=5.4.1" }
+dynamo-protocols = { version = "=5.4.3" }
 dynamo-parsers = { version = "8.1.0" }
 
 # Published on crates.io. To see all available versions:
 #   web:          https://crates.io/crates/dynamo-parsers-v2/versions
 #   sparse index: curl https://index.crates.io/dy/na/dynamo-parsers-v2   (one JSON line per release; read the "vers" field)
-dynamo-parsers-v2 = { version = "0.3.2" }
+dynamo-parsers-v2 = { version = "0.5.3" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.5.0" }
 dynamo-sidecar-common = { path = "lib/sidecar/common", version = "1.5.0" }
 fastokens = { version = "0.2.0" }
@@ -179,6 +181,10 @@ opentelemetry-otlp = { version = "0.31.0", features = [
     "reqwest-rustls",
 ] }
 opentelemetry-appender-tracing = { version = "0.31.0" }
+opentelemetry-proto = { version = "0.31.0", default-features = false, features = [
+    "gen-tonic",
+    "metrics",
+] }
 validator = { version = "0.20.0", features = ["derive"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 url = { version = "2.5", features = ["serde"] }
@@ -219,28 +225,7 @@ inherits = "release"
 debug = true
 strip = false
 
-
-# Prime carry: override the two crates the fleet pins with Prime maintenance
-# lines carrying fixes that upstream dynamo has not absorbed yet. Sources
-# declare exactly the pinned versions (=5.4.1 / 8.1.0), so NO pin bumps and
-# no API drift: the nightly code compiles unchanged.
-#   - dynamo-protocols 5.4.1: Responses API `max` reasoning effort
-#     (64bit/async-openai#573), delivered by patching async-openai 0.41.1 with
-#     the one-line variant via prime/0.41-max instead of the API-breaking 0.42,
-#     backported at prime/protocols-5.4.1.
-#   - dynamo-parsers 8.1.0 + glm47 EOF-truncation recovery
-#     (ai-dynamo/frontend-crates fix/glm47-eof-recovery-at-truncation),
-#     backported at prime/parsers-8.1.0.
-# Single source, one rev: the fleet snapshot branch declares BOTH crates at
-# exactly the pinned versions, so the graph resolves one copy of each.
-#   - dynamo-protocols 5.4.1: Responses API `max` reasoning effort
-#     (64bit/async-openai#573), delivered by patching async-openai 0.41.1 with
-#     the one-line variant via prime/0.41-max instead of the API-breaking 0.42
-#   - dynamo-parsers 8.1.0 + glm47 EOF-truncation recovery
-#     (fix/glm47-eof-recovery-at-truncation)
-# Cargo.lock pins the resolved rev. Drop this section when an upstream
-# nightly pins released crates containing both fixes.
 [patch.crates-io]
-dynamo-protocols = { git = "https://github.com/PrimeIntellect-ai/frontend-crates.git", branch = "prime/fleet-5.4.1-8.1.0" }
-dynamo-parsers = { git = "https://github.com/PrimeIntellect-ai/frontend-crates.git", branch = "prime/fleet-5.4.1-8.1.0" }
-async-openai = { git = "https://github.com/PrimeIntellect-ai/async-openai.git", branch = "prime/0.41-max" }
+dynamo-parsers = { path = "vendor/dynamo-parsers" }
+
+dynamo-parsers-v2 = { path = "vendor/dynamo-parsers-v2" }

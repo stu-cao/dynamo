@@ -579,17 +579,12 @@ ARG ENABLE_MEDIA_FFMPEG
 {% endif %}
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
-    --mount=type=secret,id=prime-fork-token,env=PRIME_FORK_TOKEN \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
     --mount=type=cache,target=/root/.cargo/git,sharing=shared \
     --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=shared \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export UV_CACHE_DIR=/root/.cache/uv && \
     export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
-    if [ -n "$PRIME_FORK_TOKEN" ]; then \
-        git config --global url."https://x-access-token:${PRIME_FORK_TOKEN}@github.com/".insteadOf "https://github.com/"; \
-        export CARGO_NET_GIT_FETCH_WITH_CLI=true; \
-    fi && \
     if [ "$USE_SCCACHE" = "true" ]; then \
         eval $(/tmp/use-sccache.sh setup-env cmake); \
     fi && \
@@ -850,17 +845,12 @@ COPY components/ /opt/dynamo/components/
 ARG ENABLE_KVBM
 RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
     --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
-    --mount=type=secret,id=prime-fork-token,env=PRIME_FORK_TOKEN \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
     --mount=type=cache,target=/root/.cargo/git,sharing=shared \
     --mount=type=cache,id=uv-root-{{ context.dynamo.uv_version }},target=/root/.cache/uv,sharing=shared \
     export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
     export UV_CACHE_DIR=/root/.cache/uv && \
     export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
-    if [ -n "$PRIME_FORK_TOKEN" ]; then \
-        git config --global url."https://x-access-token:${PRIME_FORK_TOKEN}@github.com/".insteadOf "https://github.com/"; \
-        export CARGO_NET_GIT_FETCH_WITH_CLI=true; \
-    fi && \
     ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
     if [ "$USE_SCCACHE" = "true" ]; then \
         eval $(/tmp/use-sccache.sh setup-env cmake); \

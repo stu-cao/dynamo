@@ -3,13 +3,10 @@
 
 use dynamo_llm::protocols::openai::chat_completions::tool_parser_v2::unified_family_names;
 use dynamo_parsers::reasoning::get_available_reasoning_parsers;
-use dynamo_parsers::tool_calling::parsers::get_available_tool_parsers;
+use dynamo_parsers::tool_calling::parsers::{get_available_tool_parsers, get_tool_parser_map};
 use pyo3::prelude::*;
 
-/// Append the muse unified family names, skipping any already present. fc's v1
-/// registries dropped muse, so it lives only in dynamo's `UNIFIED_FAMILIES`;
-/// `unified_family` routes to the unified pass when EITHER the tool-call or the
-/// reasoning parser is a muse name, so both name lists must accept muse.
+/// Unified-only families are absent from the legacy parser registries.
 fn with_unified_families(mut names: Vec<&'static str>) -> Vec<&'static str> {
     for &name in unified_family_names() {
         if !names.contains(&name) {
@@ -31,10 +28,23 @@ pub fn get_reasoning_parser_names() -> Vec<&'static str> {
     with_unified_families(get_available_reasoning_parsers())
 }
 
+/// Report grammar-capable registry entries separately from output-only parsers.
+/// Deployments use this to reject an unpatched runtime before accepting traffic.
+#[pyfunction]
+pub fn get_structural_tag_parser_names() -> Vec<&'static str> {
+    let mut names: Vec<_> = get_tool_parser_map()
+        .iter()
+        .filter_map(|(name, config)| config.structural_tag_builder.as_ref().map(|_| *name))
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 /// Add parsers module functions to the Python module
 pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_tool_parser_names, m)?)?;
     m.add_function(wrap_pyfunction!(get_reasoning_parser_names, m)?)?;
+    m.add_function(wrap_pyfunction!(get_structural_tag_parser_names, m)?)?;
     Ok(())
 }
 

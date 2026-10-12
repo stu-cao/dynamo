@@ -299,7 +299,8 @@ checksum = "4288f83726785267c6f2ef073a3d83dc3f9b81464e9f99898240cced85fce35a"
 [[package]]
 name = "async-openai"
 version = "0.41.1"
-source = "git+https://github.com/PrimeIntellect-ai/async-openai.git?branch=prime%2F0.41-max#e5a3037a0bdf6525db5770482888d9d230fb3173"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3007014661d5b98168b7b6f1014147bce8b1362a194783543eeb9f6117a20be9"
 dependencies = [
  "bytes",
  "derive_builder",
@@ -2840,7 +2841,6 @@ dependencies = [
 [[package]]
 name = "dynamo-parsers"
 version = "8.1.0"
-source = "git+https://github.com/PrimeIntellect-ai/frontend-crates.git?branch=prime%2Ffleet-5.4.1-8.1.0#e65c21311a40b0d83c69cad0f345f223bf1b675b"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2850,6 +2850,7 @@ dependencies = [
  "num-traits",
  "openai-harmony",
  "regex",
+ "rstest 0.25.0",
  "rustpython-ruff_python_ast",
  "rustpython-ruff_python_parser",
  "serde",
@@ -2861,9 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers-v2"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e2277648c57af9f41943c1c6abf573ed42ddbad9d05f2e4053e9d66e9a41182"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "num-traits",
@@ -2873,13 +2872,15 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "dynamo-protocols"
-version = "5.4.1"
-source = "git+https://github.com/PrimeIntellect-ai/frontend-crates.git?branch=prime%2Ffleet-5.4.1-8.1.0#e65c21311a40b0d83c69cad0f345f223bf1b675b"
+version = "5.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1cdacfc1398779cf173d5ff54438d9f14682f76875b6879853a84cc7d646228"
 dependencies = [
  "async-openai",
  "derive_builder",
@@ -2894,9 +2895,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "5.1.0"
+version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0a5b79eefdfd2bb2c01f3a187f9367db598db58a4cf17550d20f79c97656b66"
+checksum = "d4609cdbd65f8bd15c74f4531c1560d04496e8737dfb6b65b45487644b878963"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2970,6 +2971,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry_sdk",
  "parking_lot",
  "percent-encoding",
@@ -2998,6 +3000,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tokio-util",
+ "tonic 0.14.6",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
@@ -3067,9 +3070,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "1.8.0"
+version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "821c767e896f1f225b6411a5ce41dba7f114c2c97db862a13fd962195665075e"
+checksum = "ed232a9d254149a4e2e14f0a7d77f59bd64161964c0ba55267beea3955650faa"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -8231,6 +8234,18 @@ dependencies = [
 
 [[package]]
 name = "rstest"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fc39292f8613e913f7df8fa892b8944ceb47c247b78e1b1ae2f09e019be789d"
+dependencies = [
+ "futures-timer",
+ "futures-util",
+ "rstest_macros 0.25.0",
+ "rustc_version",
+]
+
+[[package]]
+name = "rstest"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5a3193c063baaa2a95a33f03035c8a72b83d97a54916055ba22d35ed3839d49"
@@ -8262,6 +8277,24 @@ name = "rstest_macros"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "825ea780781b15345a146be27eaefb05085e337e869bff01b4306a4fd4a9ad5a"
+dependencies = [
+ "cfg-if",
+ "glob",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "relative-path",
+ "rustc_version",
+ "syn 2.0.117",
+ "unicode-ident",
+]
+
+[[package]]
+name = "rstest_macros"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f168d99749d307be9de54d23fd226628d99768225ef08f6ffb52e0182a27746"
 dependencies = [
  "cfg-if",
  "glob",

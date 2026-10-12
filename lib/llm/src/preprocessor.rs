@@ -112,7 +112,6 @@ pub use crate::protocols::common::metrics::{
 };
 pub use crate::protocols::common::preprocessor::PreprocessedEmbeddingRequest;
 
-use crate::protocols::common::invalid_argument_error;
 use crate::protocols::common::llm_backend::EmbeddingsEngineOutput;
 
 fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, Option<i32>) {
@@ -124,6 +123,14 @@ fn routing_priorities(hints: Option<&AgentHints>) -> (Option<f64>, Option<u32>, 
     let strict_priority = hints.and_then(|h| h.strict_priority);
     let priority = hints.and_then(|h| h.priority);
     (priority_jump, strict_priority, priority)
+}
+
+pub(crate) fn invalid_argument_error(message: impl Into<String>) -> anyhow::Error {
+    DynamoError::builder()
+        .error_type(ErrorType::InvalidArgument)
+        .message(message.into())
+        .build()
+        .into()
 }
 
 // Preserves terminal versus recoverable failures when moka shares a
@@ -178,7 +185,7 @@ fn validate_legacy_jail_nvext_choice_count(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ToolProcessingRoute {
     MuseUnified(String),
-    QwenUnified(&'static str),
+    Unified(&'static str),
     ParserV2(String),
     LegacyJail(Option<String>),
     PassThrough,
@@ -1831,42 +1838,6 @@ impl OpenAIPreprocessor {
         }
     }
 
-    /// Public aliases that switch reasoning on or off. `normalize_thinking_aliases`
-    /// rewrites every spelling into these three keys before forwarding.
-    const THINKING_TOGGLE_KEYS: [&'static str; 3] = ["thinking", "enable_thinking", "thinking_mode"];
-
-    /// Remove the thinking on/off aliases from the `chat_template_kwargs` forwarded
-    /// to the engine's reasoning parser (`reasoning_parser_kwargs`), keeping every
-    /// other template argument (e.g. `reasoning_effort`). Drops the container when
-    /// nothing else remains. Returns whether anything was removed.
-    ///
-    /// Used when the rendered prompt provably ignored those aliases (it still ends
-    /// with the reasoning opener), so the engine-side parser and the frontend's
-    /// response parser agree that generation starts inside reasoning.
-    fn strip_ignored_thinking_kwargs(extra_args: &mut serde_json::Value) -> bool {
-        let Some(root) = extra_args.as_object_mut() else {
-            return false;
-        };
-        let Some(kwargs) = root
-            .get_mut("reasoning_parser_kwargs")
-            .and_then(|v| v.get_mut("chat_template_kwargs"))
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            return false;
-        };
-        let mut removed = false;
-        for key in Self::THINKING_TOGGLE_KEYS {
-            removed |= kwargs.remove(key).is_some();
-        }
-        if !removed {
-            return false;
-        }
-        if kwargs.is_empty() {
-            root.remove("reasoning_parser_kwargs");
-        }
-        true
-    }
-
     fn has_request_thinking_control(
         chat_template_args: Option<&HashMap<String, serde_json::Value>>,
     ) -> bool {
@@ -1990,9 +1961,9 @@ impl OpenAIPreprocessor {
             Some("deepseek_v3" | "deepseek_v3_1") => {
                 Self::deepseek_renderer_reasoning_enabled(chat_template_args, false)
             }
-            Some("deepseek_v3_2" | "deepseek_v4" | "deepseek-v4" | "deepseekv4") => {
-                Self::deepseek_renderer_reasoning_enabled(chat_template_args, true)
-            }
+            Some(
+                "deepseek_v3_2" | "deepseek_v4" | "deepseek-v4" | "deepseekv4" | "deepseek_v41",
+            ) => Self::deepseek_renderer_reasoning_enabled(chat_template_args, true),
             Some("gemma4" | "gemma-4") => thinking_enabled == Some(true),
 
             // SGLang's Mistral reasoner is active only for a concrete effort.
@@ -2300,7 +2271,8 @@ impl OpenAIPreprocessor {
             );
         };
         let model_info = model_info.get_model_info()?;
-        let tool_call_parser = mdc.runtime_config.tool_call_parser.clone();
+        let runtime_config = mdc.frontend_runtime_config()?;
+        let tool_call_parser = runtime_config.tool_call_parser.clone();
         let normalize_tool_call_args = mdc.runtime_config.tool_call_arguments_format
             == crate::local_model::runtime_config::ToolCallArgumentsFormat::JsonObject
             || mdc.runtime_config.tool_call_parser.as_deref() == Some("glm47");
@@ -2309,8 +2281,6 @@ impl OpenAIPreprocessor {
             tracing::info!(model = %mdc.display_name, lora_name, "LoRA adapter detected in MDC");
         }
 
-        // // Initialize runtime config from the ModelDeploymentCard
-        let runtime_config = mdc.runtime_config.clone();
         let token_budget = match runtime_config
             .get_engine_specific::<TokenBudget>(TOKEN_BUDGET_RUNTIME_KEY)
         {
@@ -2747,22 +2717,6 @@ impl OpenAIPreprocessor {
                 .as_object_mut()
                 .context("preprocessed extra_args must be an object")?;
             extra_args.insert("reasoning_ended".to_string(), reasoning_ended.into());
-        }
-
-        // The chat template already opened the reasoning block, so any per-request
-        // "thinking off" alias was ignored by the prompt. Do not let it reach the
-        // engine's reasoning parser either: vLLM would start that parser in content
-        // mode, open its structured-output gate at token 0, and the response parser
-        // here (which follows the prompt) would then file the forced tool call under
-        // reasoning_content. Forward only what the prompt actually honoured.
-        if prompt_injected_reasoning
-            && let Some(extra_args) = preprocessed.extra_args.as_mut()
-            && Self::strip_ignored_thinking_kwargs(extra_args)
-        {
-            tracing::debug!(
-                "Dropped thinking-toggle chat_template_kwargs from reasoning_parser_kwargs: \
-                 the rendered prompt already starts a reasoning block"
-            );
         }
 
         // If omitted, allow generation up to the remaining context length. Responses requests
@@ -4583,7 +4537,7 @@ impl OpenAIPreprocessor {
             self.tool_call_parser.as_deref(),
             self.runtime_config.reasoning_parser.as_deref(),
         ) {
-            return Ok(ToolProcessingRoute::QwenUnified(family));
+            return Ok(ToolProcessingRoute::Unified(family));
         }
 
         let effective_tool_call_parser = self.tool_call_parser.clone().or_else(|| {
@@ -4732,7 +4686,7 @@ impl OpenAIPreprocessor {
             ));
         }
 
-        if let ToolProcessingRoute::QwenUnified(family) = &tool_processing_route {
+        if let ToolProcessingRoute::Unified(family) = &tool_processing_route {
             let tool_definitions = request.inner.tools.as_ref().map(|tools| {
                 tools
                     .iter()
@@ -4898,7 +4852,7 @@ impl OpenAIPreprocessor {
                     ))
                 }
                 ToolProcessingRoute::PassThrough => Box::pin(stream),
-                ToolProcessingRoute::MuseUnified(_) | ToolProcessingRoute::QwenUnified(_) => {
+                ToolProcessingRoute::MuseUnified(_) | ToolProcessingRoute::Unified(_) => {
                     unreachable!("unified routes return before legacy response processing")
                 }
             };
@@ -5470,37 +5424,23 @@ impl OpenAIPreprocessor {
         let pending = Arc::new(Mutex::new(PendingDynamoMetadata::default()));
         let pending_in = Arc::clone(&pending);
 
-        // Per-choice recovery state — allocated only for glm47 since only that
-        // parser emits <tool_call> XML that can be truncated at max_tokens.
-        // Buffers raw input and tracks what the jail emitted per choice.index
-        // so n > 1 is handled correctly and double-emit is avoided.
+        // The legacy jail recognizes markers with a substring search. Retain
+        // GLM47 text per choice so the terminal chunk can use the shared
+        // quote-aware marker policy before exposing content to the client.
         #[derive(Default)]
         struct ChoiceRecovery {
             input_text: String,
             emitted_text: String,
-            recovered: bool,
-            // Set once the jail emits a tool call for this choice. The jail's
-            // finalize can salvage a truncated <tool_call> into a real call
-            // (glm47 EOF recovery in dynamo-parsers), and when it does, the raw
-            // markup must NOT also be released as content below.
-            emitted_tool_call: bool,
-        }
-        // Named so the bool in the recoveries tuple is legible at each use site.
-        struct PendingRecovery {
-            choice_idx: u32,
-            tail: String,
-            tail_already_emitted: bool,
         }
         let is_glm47 = tool_call_parser.as_deref() == Some("glm47");
-        // Token strings from the parser config so recovery matches the parser
-        // even if the defaults are ever overridden.
-        let glm47_cfg = dynamo_parsers::tool_calling::config::Glm47ParserConfig::default();
-        let glm47_start = glm47_cfg.tool_call_start;
-        let glm47_end = glm47_cfg.tool_call_end;
+        let glm47_config = dynamo_parsers::tool_calling::config::Glm47ParserConfig::default();
+        let glm47_start = glm47_config.tool_call_start;
+        let glm47_end = glm47_config.tool_call_end;
         let choice_recovery: Arc<Mutex<std::collections::HashMap<u32, ChoiceRecovery>>> =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
         let choice_recovery_in = Arc::clone(&choice_recovery);
-        let glm47_start_jail = glm47_start.clone();
+        let glm47_start_in = glm47_start.clone();
+        let glm47_end_in = glm47_end.clone();
 
         // The jail's own (vendored, out-of-scope) finalize logic cannot tell an
         // error-terminated input stream from one that genuinely completed — it
@@ -5562,34 +5502,52 @@ impl OpenAIPreprocessor {
                     merge_response_nvext(&mut p.nvext, nv.nvext.take());
                 }
             }
-            // Buffer input content only for glm47 (truncation recovery).
-            // Only retain from the last <tool_call> marker onward to bound
-            // memory on long responses.
             if is_glm47 && let Some(data) = &a.data {
-                let mut cr = choice_recovery_in.lock().expect("choice recovery poisoned");
+                let mut recovery = choice_recovery_in
+                    .lock()
+                    .expect("choice recovery buffer poisoned");
                 for choice in &data.inner.choices {
                     if let Some(ChatCompletionMessageContent::Text(content)) = &choice.delta.content
                     {
-                        let state = cr.entry(choice.index).or_default();
+                        let state = recovery.entry(choice.index).or_default();
                         state.input_text.push_str(content);
-                        // Drop everything before the last marker to keep
-                        // the buffer small. Walk back to a char boundary
-                        // before draining so a multi-byte char split
-                        // across chunks never triggers a panic.
-                        let mut keep_from = match state.input_text.rfind(glm47_start_jail.as_str())
-                        {
-                            Some(pos) => pos,
-                            // No marker yet — keep enough tail to
-                            // catch a marker split across two chunks.
-                            None => state
-                                .input_text
-                                .len()
-                                .saturating_sub(glm47_start_jail.len() - 1),
-                        };
-                        while keep_from > 0 && !state.input_text.is_char_boundary(keep_from) {
-                            keep_from -= 1;
+                        // A completed call is already owned by the jail. Retain only
+                        // the suffix after it, so terminal recovery examines the
+                        // final unfinished call while the shared scanner decides
+                        // whether each opener is real or quoted prose.
+                        while let Some(marker_start) = crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47") {
+                            let after_marker =
+                                &state.input_text[marker_start + glm47_start_in.len()..];
+                            let Some(end) = after_marker.find(&glm47_end_in) else {
+                                break;
+                            };
+                            state.input_text.drain(
+                                ..marker_start
+                                    + glm47_start_in.len()
+                                    + end
+                                    + glm47_end_in.len(),
+                            );
+                            state.emitted_text.clear();
                         }
-                        state.input_text.drain(..keep_from);
+                        // Text the client already holds cannot change what terminal
+                        // recovery emits, so drop it and keep the buffer proportional
+                        // to what is still pending. Without this the buffer grows for
+                        // the whole response and every chunk rescans all of it.
+                        //
+                        // A quote character is the exception: the marker scanner reads
+                        // `"<tool_call>"` as prose, and it can only know that from the
+                        // quote to its left. Dropping a quote-free prefix cannot change
+                        // any later verdict, so that is the only prefix dropped here.
+                        // A response that quotes on every chunk keeps the old growth.
+                        if !state.emitted_text.is_empty()
+                            && !state.input_text.contains(['"', '\'', '`'])
+                            && crate::protocols::openai::chat_completions::unified_parser::unquoted_native_tool_call_marker_or_prefix_start(&state.input_text, "glm47").is_none()
+                            && let Some(unemitted) =
+                                state.input_text.strip_prefix(state.emitted_text.as_str())
+                        {
+                            state.input_text = unemitted.to_string();
+                            state.emitted_text.clear();
+                        }
                     }
                 }
             }
@@ -5677,185 +5635,58 @@ impl OpenAIPreprocessor {
                 error: None,
             };
 
-            // An EOS inside a tool call is incomplete even if the engine reports stop.
-            // Report it as length so the recovery pass below treats it as truncation.
+            // BEFORE the glm47 recovery pass below: that pass keys per-choice state on
+            // `choice.index` and accumulates `emitted_text`, so a chunk carrying two entries
+            // for one index would run it twice against the same state and corrupt the
+            // truncation bookkeeping. Normalize the shape first, then recover.
+            if let Some(data) = &mut nv_chunk.data {
+                Self::coalesce_duplicate_stream_indices(&mut data.inner);
+            }
+
             if is_glm47 && let Some(data) = &mut nv_chunk.data {
-                let cr = choice_recovery.lock().expect("choice recovery poisoned");
+                let mut recovery = choice_recovery
+                    .lock()
+                    .expect("choice recovery buffer poisoned");
                 for choice in &mut data.inner.choices {
-                    let Some(state) = cr.get(&choice.index) else {
-                        continue;
-                    };
-                    let dropped_call = choice.finish_reason
-                        == Some(dynamo_protocols::types::FinishReason::Stop)
-                        && !state.emitted_tool_call
-                        && choice
-                            .delta
-                            .tool_calls
-                            .as_ref()
-                            .is_none_or(|calls| calls.is_empty())
-                        && state
-                            .input_text
-                            .rfind(glm47_start.as_str())
-                            .is_some_and(|pos| !state.input_text[pos..].contains(glm47_end.as_str()));
-                    if dropped_call {
-                        tracing::warn!(
-                            choice_index = choice.index,
-                            why = "dropped_native_tool_call_reported_as_length",
-                            "glm47 streaming: reporting length instead of stop for a tool call dropped at end of stream"
-                        );
-                        choice.finish_reason = Some(dynamo_protocols::types::FinishReason::Length);
-                    }
-                }
-            }
-
-            // glm47: on finish_reason=length, recover the last incomplete
-            // <tool_call> block. rfind skips complete blocks so earlier parsed
-            // calls are never duplicated. Recovered content WILL contain raw
-            // markup — callers that require "no tool tags in content" must
-            // filter on finish_reason=length.
-            //
-            // TODO: this recovery runs inside apply_tool_calling_jail, which
-            // the v2 path bypasses (use_parsers_v2 branch above). Adding
-            // "glm47" to V2_FAMILIES in tool_parser_v2.rs silently disables
-            // streaming recovery while aggregator.rs keeps running. At that
-            // point hoist this above the jail/v2 branch — it only needs
-            // buffered input text + finish_reason, both available there.
-            // Pass 1 (immutable): compute the recovery tail per choice and
-            // whether the jail already released it as content on this chunk.
-            // We collect into a Vec so we can release the immutable borrow on
-            // nv_chunk before mutating it in pass 2.
-            let recoveries: Vec<PendingRecovery> = if is_glm47 {
-                let mut cr = choice_recovery.lock().expect("choice recovery poisoned");
-                nv_chunk
-                    .data
-                    .iter()
-                    .flat_map(|data| data.inner.choices.iter())
-                    .filter_map(|choice| {
-                        let state = cr.entry(choice.index).or_default();
-                        if !state.recovered
-                            && let Some(ChatCompletionMessageContent::Text(t)) =
-                                &choice.delta.content
+                    let state = recovery.entry(choice.index).or_default();
+                    if let Some(marker_start) = crate::protocols::openai::chat_completions::unified_parser::unquoted_native_tool_call_marker_or_prefix_start(&state.input_text, "glm47") {
+                        let desired_content = &state.input_text[..marker_start];
+                        if choice.finish_reason
+                            == Some(dynamo_protocols::types::FinishReason::Length)
+                            && crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47").is_some()
                         {
-                            state.emitted_text.push_str(t);
-                            // Bound like input_text: retain only the suffix from
-                            // the last marker onward — all the contains(&tail)
-                            // check needs.
-                            let mut keep_from = match state.emitted_text.rfind(glm47_start.as_str())
-                            {
-                                Some(pos) => pos,
-                                None => state
-                                    .emitted_text
-                                    .len()
-                                    .saturating_sub(glm47_start.len() - 1),
-                            };
-                            while keep_from > 0 && !state.emitted_text.is_char_boundary(keep_from) {
-                                keep_from -= 1;
-                            }
-                            state.emitted_text.drain(..keep_from);
+                            tracing::warn!(
+                                choice_index = choice.index,
+                                why = "truncated_native_tool_call_suppressed",
+                                suppressed_bytes = state.input_text.len() - desired_content.len(),
+                                "glm47 streaming: suppressing incomplete native tool output on length finish"
+                            );
+                            let replacement = desired_content
+                                .strip_prefix(&state.emitted_text)
+                                .unwrap_or_default();
+                            choice.delta.content = (!replacement.is_empty()).then(|| {
+                                ChatCompletionMessageContent::Text(replacement.to_string())
+                            });
                         }
-                        // Observed on every chunk, so a call arriving in the same
-                        // chunk as finish_reason is seen before the gate below.
-                        if choice
-                            .delta
-                            .tool_calls
-                            .as_ref()
-                            .is_some_and(|calls| !calls.is_empty())
-                        {
-                            state.emitted_tool_call = true;
-                        }
-                        // Releasing the markup as content is a fallback for a
-                        // truncated block that produced NO call. Doing it anyway
-                        // hands the caller raw <tool_call> wire tags next to a tool
-                        // call it is already executing.
-                        if state.recovered
-                            || state.emitted_tool_call
-                            || !matches!(
-                                choice.finish_reason,
-                                Some(dynamo_protocols::types::FinishReason::Length)
-                            )
-                        {
-                            return None;
-                        }
-                        let tail =
-                            state
-                                .input_text
-                                .rfind(glm47_start.as_str())
-                                .and_then(|pos| {
-                                    let t = &state.input_text[pos..];
-                                    if !t.contains(glm47_end.as_str()) {
-                                        Some(t.to_string())
-                                    } else {
-                                        None
-                                    }
-                                })?;
-                        let tail_already_emitted = state.emitted_text.contains(&tail);
-                        state.recovered = true;
-                        Some(PendingRecovery {
-                            choice_idx: choice.index,
-                            tail,
-                            tail_already_emitted,
-                        })
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
-
-            // Pass 2 (mutable): when the jail already released the tail verbatim,
-            // suppress the finish chunk's content entirely. The recovery chunk
-            // carries just the marker-onwards tail, matching the non-streaming
-            // path (rfind result only, no post-call prose).
-            for pr in &recoveries {
-                if !pr.tail_already_emitted {
-                    continue;
-                }
-                if let Some(ref mut data) = nv_chunk.data {
-                    for rc in data
-                        .inner
-                        .choices
-                        .iter_mut()
-                        .filter(|c| c.index == pr.choice_idx)
+                    } else if choice.finish_reason
+                        == Some(dynamo_protocols::types::FinishReason::Length)
+                        && choice.delta.tool_calls.is_none()
                     {
-                        // The jail released the truncated block verbatim as content
-                        // on this chunk, potentially preceded by post-call prose.
-                        // glm47's parser drops post-call prose deliberately, so
-                        // suppress the whole content here and let the recovery
-                        // chunk carry just the marker-onwards tail — matching batch.
-                        rc.delta.content = None;
+                        let replacement = state
+                            .input_text
+                            .strip_prefix(&state.emitted_text)
+                            .unwrap_or_default();
+                        choice.delta.content = (!replacement.is_empty())
+                            .then(|| ChatCompletionMessageContent::Text(replacement.to_string()));
+                    }
+
+                    if let Some(ChatCompletionMessageContent::Text(content)) = &choice.delta.content {
+                        state.emitted_text.push_str(content);
                     }
                 }
             }
 
-            // Pass 3: emit a recovery chunk per affected choice carrying just
-            // the truncated tail (marker onwards, no post-call prose).
-            let recovery_chunks: Vec<_> = recoveries
-                .into_iter()
-                .filter_map(|pr| {
-                    let PendingRecovery {
-                        choice_idx, tail, ..
-                    } = pr;
-                    tracing::warn!(
-                        choice_index = choice_idx,
-                        recovered_bytes = tail.len(),
-                        "glm47 streaming: partial <tool_call> emitted as content \
-                         on length finish"
-                    );
-                    let mut rec = nv_chunk.clone();
-                    rec.id = None;
-                    scrub_synthetic_chunk_metadata(&mut rec);
-                    let rd = rec.data.as_mut()?;
-                    rd.inner.choices.retain(|c| c.index == choice_idx);
-                    for rc in &mut rd.inner.choices {
-                        rc.delta.content = Some(ChatCompletionMessageContent::Text(tail.clone()));
-                        rc.delta.tool_calls = None;
-                        rc.finish_reason = None;
-                        rc.logprobs = None;
-                    }
-                    Some(rec)
-                })
-                .collect();
-
-            futures::stream::iter(recovery_chunks.into_iter().chain(std::iter::once(nv_chunk)))
+            futures::stream::iter(std::iter::once(nv_chunk))
         });
 
         // Once an upstream error is latched, drop any output the jail synthesized
@@ -5931,6 +5762,186 @@ impl OpenAIPreprocessor {
         Self::hold_usage_until_stream_end(with_eof_metadata)
     }
 
+    /// Merge duplicate-index entries inside one streaming chunk.
+    ///
+    /// The jail's guided-streaming release path — taken when a forced `tool_choice`
+    /// installs a JSON grammar — can emit a chunk whose `choices`, or a choice's
+    /// `delta.tool_calls`, carries more than one entry for the same index: a
+    /// tool-call opener beside its own first argument fragment, or a finish flush
+    /// beside the fragment it should have joined.
+    ///
+    /// With `n = 1` that is not valid OpenAI streaming. A client is entitled to key
+    /// on `index` and keep one entry per index per chunk, and one that keeps the
+    /// last silently drops the other's `arguments` — truncating the call mid-value
+    /// while `finish_reason` still reports `tool_calls`, so nothing downstream can
+    /// tell the call was corrupted.
+    ///
+    /// The jail ships in the published `dynamo-parsers` crate, so normalizing at
+    /// this boundary is what keeps the malformed shape off the wire whichever
+    /// release is pinned. A no-op, and allocation-free, for the overwhelmingly
+    /// common chunk that already holds one entry per index.
+    fn coalesce_duplicate_stream_indices(
+        inner: &mut dynamo_protocols::types::CreateChatCompletionStreamResponse,
+    ) {
+        for choice in &mut inner.choices {
+            Self::coalesce_duplicate_tool_call_indices(&mut choice.delta.tool_calls);
+        }
+
+        let has_duplicate_choice = inner.choices.iter().enumerate().any(|(i, choice)| {
+            inner.choices[..i]
+                .iter()
+                .any(|seen| seen.index == choice.index)
+        });
+        if !has_duplicate_choice {
+            return;
+        }
+
+        let mut merged: Vec<dynamo_protocols::types::ChatChoiceStream> =
+            Vec::with_capacity(inner.choices.len());
+        for choice in std::mem::take(&mut inner.choices) {
+            match merged.iter_mut().find(|seen| {
+                seen.index == choice.index && Self::choices_are_mergeable(seen, &choice)
+            }) {
+                Some(target) => Self::merge_duplicate_choice(target, choice),
+                // No mergeable peer: keep it as its own entry. A chunk we cannot fold
+                // without losing content goes out unchanged rather than half-dropped.
+                None => merged.push(choice),
+            }
+        }
+        inner.choices = merged;
+    }
+
+    /// Whether two same-index entries can be folded without losing information.
+    ///
+    /// Only `Text` content concatenates meaningfully. `Parts` (multimodal) has no
+    /// defined concatenation, and dropping one side would lose data that the
+    /// malformed-but-intact chunk still carries — so such a chunk is left exactly as
+    /// it arrived rather than silently halved.
+    fn choices_are_mergeable(
+        a: &dynamo_protocols::types::ChatChoiceStream,
+        b: &dynamo_protocols::types::ChatChoiceStream,
+    ) -> bool {
+        !matches!(
+            (&a.delta.content, &b.delta.content),
+            (
+                Some(ChatCompletionMessageContent::Parts(_)),
+                Some(ChatCompletionMessageContent::Parts(_))
+            ) | (Some(ChatCompletionMessageContent::Parts(_)), Some(_))
+                | (Some(_), Some(ChatCompletionMessageContent::Parts(_)))
+        )
+    }
+
+    /// Fold `extra` into `target`, which carries the same choice index.
+    ///
+    /// The delta is destructured exhaustively on purpose: `dynamo-protocols` is a
+    /// separately versioned crate, and a field added there must break this build
+    /// rather than be silently dropped on the merge path.
+    fn merge_duplicate_choice(
+        target: &mut dynamo_protocols::types::ChatChoiceStream,
+        extra: dynamo_protocols::types::ChatChoiceStream,
+    ) {
+        let dynamo_protocols::types::ChatChoiceStream {
+            index: _,
+            delta: extra_delta,
+            finish_reason: extra_finish_reason,
+            logprobs: extra_logprobs,
+        } = extra;
+        let dynamo_protocols::types::ChatCompletionStreamResponseDelta {
+            content: extra_content,
+            function_call: extra_function_call,
+            tool_calls: extra_tool_calls,
+            role: extra_role,
+            refusal: extra_refusal,
+            reasoning_content: extra_reasoning_content,
+        } = extra_delta;
+
+        let delta = &mut target.delta;
+
+        match (delta.content.take(), extra_content) {
+            (
+                Some(ChatCompletionMessageContent::Text(mut existing)),
+                Some(ChatCompletionMessageContent::Text(added)),
+            ) => {
+                existing.push_str(&added);
+                delta.content = Some(ChatCompletionMessageContent::Text(existing));
+            }
+            // `choices_are_mergeable` rejects the ambiguous pairs before we get here,
+            // so at most one side is populated.
+            (existing, added) => delta.content = existing.or(added),
+        }
+
+        match (delta.reasoning_content.take(), extra_reasoning_content) {
+            (Some(mut existing), Some(added)) => {
+                existing.push_str(&added);
+                delta.reasoning_content = Some(existing);
+            }
+            (existing, added) => delta.reasoning_content = existing.or(added),
+        }
+
+        match (delta.tool_calls.take(), extra_tool_calls) {
+            (Some(mut existing), Some(added)) => {
+                existing.extend(added);
+                delta.tool_calls = Some(existing);
+            }
+            (existing, added) => delta.tool_calls = existing.or(added),
+        }
+        Self::coalesce_duplicate_tool_call_indices(&mut delta.tool_calls);
+
+        delta.role = delta.role.take().or(extra_role);
+        delta.refusal = delta.refusal.take().or(extra_refusal);
+        delta.function_call = delta.function_call.take().or(extra_function_call);
+
+        // A finish reason arrives once for a choice; take it from whichever entry
+        // carried it rather than letting the position of the flush decide.
+        target.finish_reason = target.finish_reason.take().or(extra_finish_reason);
+        target.logprobs = target.logprobs.take().or(extra_logprobs);
+    }
+
+    /// Merge `tool_calls` entries that share a call index, concatenating their
+    /// `arguments` fragments in arrival order.
+    fn coalesce_duplicate_tool_call_indices(
+        tool_calls: &mut Option<Vec<dynamo_protocols::types::ChatCompletionMessageToolCallChunk>>,
+    ) {
+        let Some(chunks) = tool_calls.as_mut() else {
+            return;
+        };
+        let has_duplicate = chunks
+            .iter()
+            .enumerate()
+            .any(|(i, chunk)| chunks[..i].iter().any(|seen| seen.index == chunk.index));
+        if !has_duplicate {
+            return;
+        }
+
+        let mut merged: Vec<dynamo_protocols::types::ChatCompletionMessageToolCallChunk> =
+            Vec::with_capacity(chunks.len());
+        for chunk in std::mem::take(chunks) {
+            let Some(target) = merged.iter_mut().find(|seen| seen.index == chunk.index) else {
+                merged.push(chunk);
+                continue;
+            };
+            target.id = target.id.take().or(chunk.id);
+            target.r#type = target.r#type.take().or(chunk.r#type);
+            match (target.function.take(), chunk.function) {
+                (Some(mut existing), Some(added)) => {
+                    existing.name = existing.name.take().or(added.name);
+                    match (existing.arguments.take(), added.arguments) {
+                        (Some(mut fragment), Some(rest)) => {
+                            fragment.push_str(&rest);
+                            existing.arguments = Some(fragment);
+                        }
+                        (existing_args, added_args) => {
+                            existing.arguments = existing_args.or(added_args)
+                        }
+                    }
+                    target.function = Some(existing);
+                }
+                (existing, added) => target.function = existing.or(added),
+            }
+        }
+        *chunks = merged;
+    }
+
     /// Whether the selected tool-call or reasoning parser depends on the
     /// engine emitting special tokens (e.g. Gemma 4's `<|tool_call>` /
     /// `<|channel>`). Mirrors upstream vLLM's per-parser `adjust_request`
@@ -5978,6 +5989,7 @@ impl OpenAIPreprocessor {
                 | Some("inkling")
                 | Some("muse_glimmer")
                 | Some("muse")
+                | Some("deepseek_v41")
         ) || matches!(
             reasoning_parser,
             Some("gemma4")
@@ -5992,6 +6004,7 @@ impl OpenAIPreprocessor {
                 | Some("inkling")
                 | Some("muse_glimmer")
                 | Some("muse")
+                | Some("deepseek_v41")
         )
     }
 
@@ -6151,6 +6164,7 @@ impl OpenAIPreprocessor {
             reasoning_parser,
             Some(
                 "deepseek_v4"
+                    | "deepseek_v41"
                     | "deepseek-v4"
                     | "deepseekv4"
                     | "glm45"
@@ -6186,7 +6200,9 @@ impl OpenAIPreprocessor {
     ) -> Option<bool> {
         let should_forward = matches!(
             reasoning_parser,
-            Some("minimax_m2" | "minimax_m3" | "minimax-m3" | "kimi_k3" | "kimi-k3")
+            Some(
+                "minimax_m2" | "minimax_m3" | "minimax-m3" | "kimi_k3" | "kimi-k3" | "deepseek_v41"
+            )
         );
         if should_forward
             && Self::prompt_injected_reasoning_start(reasoning_parser, formatted_prompt)
@@ -6243,7 +6259,7 @@ impl OpenAIPreprocessor {
             }
             Some(
                 "deepseek_r1" | "deepseek_v3_2" | "deepseek_v4" | "deepseek-v4" | "deepseekv4"
-                | "minimax_m2",
+                | "deepseek_v41" | "minimax_m2",
             ) => !Self::deepseek_renderer_reasoning_enabled(chat_template_args, true),
             Some("gemma4") | Some("gemma-4") => {
                 dynamo_renderer::thinking_bool_from_args(chat_template_args) != Some(true)
@@ -7479,6 +7495,73 @@ mod tests {
     };
 
     #[test]
+    fn deepseek_v41_defaults_missing_worker_parser_metadata() {
+        let mut mdc = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
+        .unwrap();
+        mdc.model_type = crate::model_type::ModelType::Chat;
+        let model_dir = tempfile::tempdir().unwrap();
+        let mut config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                "tests/data/sample-models/mock-llama-3.1-8b-instruct/config.json",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        config["model_type"] = serde_json::json!("deepseek_v41");
+        std::fs::write(model_dir.path().join("config.json"), config.to_string()).unwrap();
+        mdc.model_info =
+            Some(crate::model_card::ModelInfoType::from_disk(model_dir.path()).unwrap());
+        let preprocessor = OpenAIPreprocessor::new(mdc.clone()).unwrap();
+        assert_eq!(
+            preprocessor.tool_call_parser.as_deref(),
+            Some("deepseek_v41")
+        );
+        assert_eq!(
+            preprocessor.runtime_config.reasoning_parser.as_deref(),
+            Some("deepseek_v41")
+        );
+        mdc.runtime_config.tool_call_parser = Some("qwen3_coder".into());
+        mdc.runtime_config.reasoning_parser = Some("qwen3".into());
+        let explicit = OpenAIPreprocessor::new(mdc).unwrap();
+        assert_eq!(explicit.tool_call_parser.as_deref(), Some("qwen3_coder"));
+        assert_eq!(
+            explicit.runtime_config.reasoning_parser.as_deref(),
+            Some("qwen3")
+        );
+    }
+
+    #[test]
+    fn deepseek_v41_preserves_markers_and_initializes_backend_reasoning() {
+        for (tool, reasoning) in [(Some("deepseek_v41"), None), (None, Some("deepseek_v41"))] {
+            assert!(OpenAIPreprocessor::parser_requires_special_tokens(
+                tool, reasoning
+            ));
+        }
+        assert_eq!(
+            OpenAIPreprocessor::prompt_injected_reasoning_ended_arg(
+                Some("deepseek_v41"),
+                Some("<｜Assistant｜><think>"),
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            OpenAIPreprocessor::prompt_injected_reasoning_ended_arg(
+                Some("deepseek_v41"),
+                Some("<｜Assistant｜></think>"),
+            ),
+            None
+        );
+        let disabled = HashMap::from([("thinking".to_string(), serde_json::json!(false))]);
+        assert!(OpenAIPreprocessor::is_reasoning_disabled_by_request(
+            Some("deepseek_v41"),
+            Some(&disabled)
+        ));
+    }
+
+    #[test]
     fn guided_tool_streaming_release_only_when_guided_json_and_not_rolled_back() {
         assert!(
             OpenAIPreprocessor::guided_tool_streaming_release(true, false),
@@ -7510,7 +7593,7 @@ mod tests {
 
         for route in [
             ToolProcessingRoute::MuseUnified("muse_glimmer".to_string()),
-            ToolProcessingRoute::QwenUnified("qwen3"),
+            ToolProcessingRoute::Unified("qwen3"),
             ToolProcessingRoute::ParserV2("qwen3_coder".to_string()),
             ToolProcessingRoute::PassThrough,
         ] {
@@ -7757,6 +7840,159 @@ mod tests {
         choice.delta.content = None;
         choice.finish_reason = Some(FinishReason::Stop);
         chunk
+    }
+
+    fn glm47_stream_chunk(
+        content: &str,
+        finish_reason: Option<FinishReason>,
+    ) -> Annotated<NvCreateChatCompletionStreamResponse> {
+        let mut chunk = chat_stream_chunk(0, Some(Role::Assistant));
+        let choice = &mut chunk.data.as_mut().unwrap().inner.choices[0];
+        choice.delta.content = Some(ChatCompletionMessageContent::Text(content.to_string()));
+        choice.finish_reason = finish_reason;
+        chunk
+    }
+
+    async fn apply_glm47_streaming_length(
+        chunks: &[&str],
+    ) -> Vec<Annotated<NvCreateChatCompletionStreamResponse>> {
+        let chunks: Vec<String> = chunks.iter().map(|chunk| (*chunk).to_string()).collect();
+        let chunk_count = chunks.len();
+        OpenAIPreprocessor::apply_tool_calling_jail(
+            Some("glm47".to_string()),
+            None,
+            None,
+            false,
+            false,
+            stream::iter(chunks.into_iter().enumerate().map(move |(index, content)| {
+                glm47_stream_chunk(
+                    &content,
+                    (index + 1 == chunk_count).then_some(FinishReason::Length),
+                )
+            })),
+        )
+        .collect()
+        .await
+    }
+
+    fn stream_content(output: &[Annotated<NvCreateChatCompletionStreamResponse>]) -> String {
+        output
+            .iter()
+            .flat_map(|response| response.data.iter())
+            .flat_map(|data| data.inner.choices.iter())
+            .filter_map(|choice| match &choice.delta.content {
+                Some(ChatCompletionMessageContent::Text(content)) => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_glm47_streaming_length_output(
+        output: &[Annotated<NvCreateChatCompletionStreamResponse>],
+        expected_content: &str,
+        split: usize,
+    ) {
+        assert_eq!(
+            stream_content(output),
+            expected_content,
+            "split at byte {split} must reconstruct the complete visible response"
+        );
+        assert!(
+            output
+                .iter()
+                .flat_map(|response| response.data.iter())
+                .flat_map(|data| data.inner.choices.iter())
+                .any(|choice| choice.finish_reason == Some(FinishReason::Length)),
+            "split at byte {split} must preserve the terminal length delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn glm47_streaming_length_preserves_prose_and_suppresses_incomplete_marker() {
+        let output = apply_glm47_streaming_length(&[
+            "I can help. <tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+        ])
+        .await;
+
+        assert_eq!(stream_content(&output), "I can help. ");
+        assert!(
+            output
+                .iter()
+                .flat_map(|response| response.data.iter())
+                .flat_map(|data| data.inner.choices.iter())
+                .any(|choice| choice.finish_reason == Some(FinishReason::Length))
+        );
+    }
+
+    #[tokio::test]
+    async fn glm47_streaming_length_preserves_quoted_marker_prose() {
+        let content = r#"The literal "<tool_call>" marker is part of the explanation."#;
+        for split in content.char_indices().map(|(index, _)| index).skip(1) {
+            let output =
+                apply_glm47_streaming_length(&[&content[..split], &content[split..]]).await;
+            assert_glm47_streaming_length_output(&output, content, split);
+        }
+    }
+
+    #[tokio::test]
+    async fn glm47_streaming_length_suppresses_incomplete_marker_at_every_split() {
+        let input = "I can help. <tool_call>get_weather<arg_key>city</arg_key><arg_value>Par";
+        for split in input.char_indices().map(|(index, _)| index).skip(1) {
+            let output = apply_glm47_streaming_length(&[&input[..split], &input[split..]]).await;
+            assert_glm47_streaming_length_output(&output, "I can help. ", split);
+        }
+    }
+
+    /// A prose-only answer never completes a call, so nothing drains the recovery
+    /// buffer through the marker path. The buffer must still stay proportional to the
+    /// unemitted tail, or every chunk rescans the whole response.
+    #[tokio::test]
+    async fn glm47_streaming_prose_only_round_trips_without_retaining_the_response() {
+        let chunk_text = "the quick brown fox ";
+        let chunks: Vec<&str> = std::iter::repeat_n(chunk_text, 400).collect();
+        let output = apply_glm47_streaming_length(&chunks).await;
+
+        assert_eq!(stream_content(&output), chunk_text.repeat(400));
+    }
+
+    /// The recovery buffer holds only what the client has not seen yet, so a long
+    /// prose answer must still arrive whole. Without the compaction this text is
+    /// retained and rescanned in full on every chunk.
+    #[tokio::test]
+    async fn glm47_streaming_long_prose_survives_buffer_compaction() {
+        let chunks: Vec<String> = (0..400).map(|i| format!("chunk {i} of prose. ")).collect();
+        let expected: String = chunks.concat();
+        let borrowed: Vec<&str> = chunks.iter().map(String::as_str).collect();
+
+        let output = apply_glm47_streaming_length(&borrowed).await;
+
+        assert_eq!(stream_content(&output), expected);
+    }
+
+    #[tokio::test]
+    async fn glm47_streaming_length_keeps_an_empty_safe_terminal_recovery_delta() {
+        let output = apply_glm47_streaming_length(&[
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+        ])
+        .await;
+
+        assert!(stream_content(&output).is_empty());
+        let terminal_choices: Vec<_> = output
+            .iter()
+            .flat_map(|response| response.data.iter())
+            .flat_map(|data| data.inner.choices.iter())
+            .filter(|choice| choice.finish_reason == Some(FinishReason::Length))
+            .collect();
+        assert_eq!(
+            terminal_choices.len(),
+            1,
+            "the recovery event must be observable"
+        );
+        assert!(
+            terminal_choices[0].delta.content.is_none()
+                && terminal_choices[0].delta.tool_calls.is_none(),
+            "the observable recovery delta must not expose raw markup or partial arguments"
+        );
     }
 
     async fn apply_kimi_k3_no_tools(
@@ -9288,53 +9524,6 @@ mod tests {
         }
     }
 
-    /// A prompt-injected reasoning block means the template ignored the request's
-    /// thinking toggles; they must not reach the engine's reasoning parser, while
-    /// every other template argument still does.
-    #[test]
-    fn test_strip_ignored_thinking_kwargs_keeps_effort_drops_toggles() {
-        let mut extra_args = serde_json::json!({
-            "reasoning_parser_kwargs": {"chat_template_kwargs": {
-                "thinking": false, "enable_thinking": false, "thinking_mode": "disabled",
-                "reasoning_effort": "low", "clear_thinking": true
-            }},
-            "reasoning_ended": false
-        });
-        assert!(OpenAIPreprocessor::strip_ignored_thinking_kwargs(&mut extra_args));
-        assert_eq!(
-            extra_args,
-            serde_json::json!({
-                "reasoning_parser_kwargs": {"chat_template_kwargs": {
-                    "reasoning_effort": "low", "clear_thinking": true
-                }},
-                "reasoning_ended": false
-            })
-        );
-    }
-
-    #[test]
-    fn test_strip_ignored_thinking_kwargs_drops_empty_container() {
-        let mut extra_args = serde_json::json!({
-            "reasoning_parser_kwargs": {"chat_template_kwargs": {"thinking_mode": "disabled"}},
-            "nvext": {"x": 1}
-        });
-        assert!(OpenAIPreprocessor::strip_ignored_thinking_kwargs(&mut extra_args));
-        assert_eq!(extra_args, serde_json::json!({"nvext": {"x": 1}}));
-    }
-
-    #[test]
-    fn test_strip_ignored_thinking_kwargs_is_a_noop_without_toggles() {
-        for value in [
-            serde_json::json!({"reasoning_parser_kwargs": {"chat_template_kwargs": {"reasoning_effort": "high"}}}),
-            serde_json::json!({"nvext": {"x": 1}}),
-            serde_json::json!(null),
-        ] {
-            let mut extra_args = value.clone();
-            assert!(!OpenAIPreprocessor::strip_ignored_thinking_kwargs(&mut extra_args));
-            assert_eq!(extra_args, value);
-        }
-    }
-
     /// Verifies parser metadata is omitted when no reasoning parser is configured.
     #[test]
     fn test_backend_extra_args_omits_reasoning_metadata_without_configured_parser() {
@@ -9966,6 +10155,14 @@ mod tests {
         {% if not ns.has_user %}{{ raise_exception('No user query found in messages.') }}{% endif %}\
         {{ messages[0]['content'] }}";
 
+    const REQUIRES_LEADING_SYSTEM_TEMPLATE: &str = "\
+        {%- for message in messages -%}\
+            {%- if message['role'] == 'system' and not loop.first -%}\
+                {{- raise_exception('System message must be at the beginning.') -}}\
+            {%- endif -%}\
+            {{- message['role'] }}:{{ message['content'] }}\n\
+        {%- endfor -%}";
+
     fn render_through_preprocessor(
         formatter: &dyn OAIPromptFormatter,
         request: &dyn OAIChatLikeRequest,
@@ -10019,6 +10216,43 @@ mod tests {
         let rendered = render_through_preprocessor(formatter.as_ref(), &request).unwrap();
 
         assert_eq!(rendered.as_str(), "hello");
+    }
+
+    #[test]
+    fn test_nonleading_system_message_normalized_for_strict_template() {
+        let formatter = test_prompt_formatter(REQUIRES_LEADING_SYSTEM_TEMPLATE);
+        let anthropic_request: crate::protocols::anthropic::AnthropicCreateMessageRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "max_tokens": 100,
+                "system": "You are Claude Code.",
+                "messages": [
+                    {"role": "user", "content": "Run make test."},
+                    {"role": "system", "content": "Available agent types and skills."}
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "description": "Run a shell command",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        },
+                        "required": ["command"]
+                    }
+                }]
+            }))
+            .unwrap();
+        let request: NvCreateChatCompletionRequest = anthropic_request.try_into().unwrap();
+
+        let rendered = render_through_preprocessor(formatter.as_ref(), &request).unwrap();
+
+        assert_eq!(
+            rendered.as_str(),
+            "system:You are Claude Code.\
+             user:Run make test.\
+             user:Available agent types and skills."
+        );
     }
 
     #[test]
@@ -11763,5 +11997,191 @@ mod tests {
             image,
             video(2)
         ]));
+    }
+
+    /// Build one streaming chunk from `(choice_index, tool_call_index, id, name, args)`
+    /// tuples, one `choices` entry per tuple — the shape the guided-streaming jail
+    /// can emit with repeated indices.
+    fn chunk_from(
+        entries: Vec<(u32, Vec<(u32, Option<&str>, Option<&str>, Option<&str>)>)>,
+        finish_reason: Option<FinishReason>,
+    ) -> CreateChatCompletionStreamResponse {
+        use dynamo_protocols::types::{ChatCompletionMessageToolCallChunk, FunctionCallStream};
+        let choices = entries
+            .into_iter()
+            .map(|(choice_index, calls)| ChatChoiceStream {
+                index: choice_index,
+                delta: ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: Some(
+                        calls
+                            .into_iter()
+                            .map(|(index, id, name, arguments)| {
+                                ChatCompletionMessageToolCallChunk {
+                                    index,
+                                    id: id.map(str::to_string),
+                                    r#type: None,
+                                    function: Some(FunctionCallStream {
+                                        name: name.map(str::to_string),
+                                        arguments: arguments.map(str::to_string),
+                                    }),
+                                }
+                            })
+                            .collect(),
+                    ),
+                    role: None,
+                    refusal: None,
+                    reasoning_content: None,
+                },
+                finish_reason: None,
+                logprobs: None,
+            })
+            .collect::<Vec<_>>();
+        let mut inner = CreateChatCompletionStreamResponse {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "test".to_string(),
+            system_fingerprint: None,
+            choices,
+            usage: None,
+            service_tier: None,
+        };
+        if let (Some(reason), Some(first)) = (finish_reason, inner.choices.first_mut()) {
+            first.finish_reason = Some(reason);
+        }
+        inner
+    }
+
+    fn arguments_of(inner: &CreateChatCompletionStreamResponse, choice_index: u32) -> String {
+        inner
+            .choices
+            .iter()
+            .filter(|c| c.index == choice_index)
+            .flat_map(|c| c.delta.tool_calls.iter().flatten())
+            .filter_map(|tc| tc.function.as_ref().and_then(|f| f.arguments.clone()))
+            .collect()
+    }
+
+    /// An opener and its first argument fragment arriving as two `tool_calls`
+    /// entries under the same call index must merge, not stay split.
+    #[test]
+    fn coalesces_duplicate_tool_call_indices_within_one_choice() {
+        let mut inner = chunk_from(
+            vec![(
+                0,
+                vec![
+                    (0, Some("call-1"), Some("calculate"), Some("")),
+                    (0, None, None, Some("{\"expression\": \"")),
+                ],
+            )],
+            None,
+        );
+
+        OpenAIPreprocessor::coalesce_duplicate_stream_indices(&mut inner);
+
+        let calls = inner.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1, "one entry per call index");
+        assert_eq!(calls[0].id.as_deref(), Some("call-1"), "opener id survives");
+        let function = calls[0].function.as_ref().unwrap();
+        assert_eq!(function.name.as_deref(), Some("calculate"));
+        assert_eq!(
+            function.arguments.as_deref(),
+            Some("{\"expression\": \""),
+            "the fragment must ride on the merged entry, not a second one"
+        );
+    }
+
+    /// The regression this exists for: a final argument fragment and a finish flush
+    /// arriving as two `choices` entries with the same index. A client keeping the
+    /// last entry used to lose the fragment, truncating the call mid-value.
+    #[test]
+    fn coalesces_duplicate_choice_indices_without_losing_the_final_fragment() {
+        let mut inner = chunk_from(
+            vec![(0, vec![(0, None, None, Some("6\"}"))]), (0, vec![])],
+            None,
+        );
+        // second entry is the bare finish flush: no tool_calls at all
+        inner.choices[1].delta.tool_calls = None;
+        inner.choices[1].finish_reason = Some(FinishReason::ToolCalls);
+
+        OpenAIPreprocessor::coalesce_duplicate_stream_indices(&mut inner);
+
+        assert_eq!(inner.choices.len(), 1, "one entry per choice index");
+        assert_eq!(
+            arguments_of(&inner, 0),
+            "6\"}",
+            "the final fragment must not be displaced by the flush"
+        );
+        assert_eq!(
+            inner.choices[0].finish_reason,
+            Some(FinishReason::ToolCalls),
+            "the flush's finish reason is carried onto the merged choice"
+        );
+    }
+
+    /// Two genuinely distinct calls keep their own slots and their own arguments.
+    #[test]
+    fn distinct_tool_call_indices_are_left_alone() {
+        let mut inner = chunk_from(
+            vec![(
+                0,
+                vec![
+                    (0, Some("call-a"), Some("calculate"), Some("{\"a\": 1}")),
+                    (1, Some("call-b"), Some("calculate"), Some("{\"b\": 2}")),
+                ],
+            )],
+            None,
+        );
+
+        OpenAIPreprocessor::coalesce_duplicate_stream_indices(&mut inner);
+
+        let calls = inner.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2, "distinct call indices must not be merged");
+        assert_eq!(calls[0].id.as_deref(), Some("call-a"));
+        assert_eq!(calls[1].id.as_deref(), Some("call-b"));
+    }
+
+    /// The common, already-well-formed chunk must pass through byte-identical.
+    #[test]
+    fn well_formed_chunk_is_unchanged() {
+        let mut inner = chunk_from(
+            vec![(0, vec![(0, Some("call-1"), Some("calculate"), Some("{}"))])],
+            Some(FinishReason::ToolCalls),
+        );
+        let before = serde_json::to_string(&inner).unwrap();
+
+        OpenAIPreprocessor::coalesce_duplicate_stream_indices(&mut inner);
+
+        assert_eq!(
+            serde_json::to_string(&inner).unwrap(),
+            before,
+            "a chunk with one entry per index must be untouched"
+        );
+    }
+
+    /// Two same-index entries whose content cannot be concatenated must both survive:
+    /// folding them would drop data the malformed-but-intact chunk still carries.
+    #[test]
+    fn unmergeable_multimodal_content_passes_through_untouched() {
+        use dynamo_protocols::types::{
+            ChatCompletionMessageContent, ChatCompletionResponseContentPart,
+        };
+        let mut inner = chunk_from(vec![(0, vec![]), (0, vec![])], None);
+        for choice in &mut inner.choices {
+            choice.delta.tool_calls = None;
+            choice.delta.content = Some(ChatCompletionMessageContent::Parts(Vec::<
+                ChatCompletionResponseContentPart,
+            >::new()));
+        }
+        let before = inner.clone();
+
+        OpenAIPreprocessor::coalesce_duplicate_stream_indices(&mut inner);
+
+        assert_eq!(
+            inner, before,
+            "a chunk that cannot be folded without losing content must go out unchanged"
+        );
     }
 }

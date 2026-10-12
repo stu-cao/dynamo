@@ -14,6 +14,9 @@ FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS pre_runtime
 {% endif %}
 
 ARG MODELEXPRESS_VERSION
+{% if device == "cuda" %}
+ARG CUDA_MAJOR
+{% endif %}
 
 WORKDIR /workspace
 
@@ -180,11 +183,37 @@ RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tm
 # Install SGLang-specific runtime dependencies without changing the upstream
 # dependency solution. imageio-ffmpeg is installed from source (no bundled
 # binary) for the VP9 video-encode path; see requirements.sglang.txt.
+{% if device == "cuda" %}
 RUN --mount=type=bind,source=./container/deps/requirements.sglang.txt,target=/tmp/requirements.sglang.txt \
     --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     export PIP_CACHE_DIR=/root/.cache/pip && \
+    [ "$CUDA_MAJOR" = "13" ] || { echo "ERROR: requirements.sglang.txt hardcodes the mooncake-transfer-engine-cuda13 distribution; got CUDA_MAJOR=$CUDA_MAJOR" >&2; exit 1; } && \
     pip install --break-system-packages --force-reinstall --no-deps \
         --requirement /tmp/requirements.sglang.txt
+{% else %}
+# mooncake and PyNvVideoCodec are CUDA-only. The mooncake floor names the CUDA 13
+# distribution, and PyNvVideoCodec decodes on NVDEC through libnvcuvid, so both
+# are inert on the XPU image and neither is present in its base. The patterns are
+# anchored to the line start so they cannot match inside another requirement, and
+# the checks fail the build if either package arrives by another route -- a filter
+# that silently stopped matching would otherwise look like success. Both checks
+# are positive tests with no `!` and no stderr redirect, so a broken interpreter
+# fails the build instead of passing it vacuously.
+#
+# Whole-RUN branches, rather than a conditional inside one RUN: a `{% raw %}{% if %}{% endraw %}` in the
+# middle of a `\`-continued command emits a blank line that ends the command
+# early. Matches the equivalent branch in vllm_runtime.Dockerfile.
+RUN --mount=type=bind,source=./container/deps/requirements.sglang.txt,target=/tmp/requirements.sglang.txt \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    export PIP_CACHE_DIR=/root/.cache/pip && \
+    grep -v -e '^PyNvVideoCodec' -e '^mooncake-transfer-engine-cuda13' \
+        /tmp/requirements.sglang.txt > /tmp/requirements.sglang.nonvidia.txt && \
+    pip install --break-system-packages --force-reinstall --no-deps \
+        --requirement /tmp/requirements.sglang.nonvidia.txt && \
+    rm -f /tmp/requirements.sglang.nonvidia.txt && \
+    python3 -c "import importlib.util,sys; sys.exit(1 if importlib.util.find_spec('PyNvVideoCodec') else 0)" && \
+    python3 -c "import importlib.metadata as m, re, sys; names={re.sub(r'[-_.]+', '-', n).lower() for d in m.distributions() if (n := (d.metadata or {}).get('Name'))}; sys.exit(1 if 'mooncake-transfer-engine-cuda13' in names else 0)"
+{% endif %}
 
 # Remove the codec-bearing video-DECODE components from the upstream SGLang image
 # (PyAV, decord, OpenCV, torchcodec + any base ffmpeg/libav*), then copy the
@@ -245,6 +274,47 @@ RUN set -eux; \
         /usr/local/src/ffmpeg \
         /root/.cache/pip; \
     ldconfig
+
+# The dev-dsv41 Ubuntu 24.04 base also carries its distro FFmpeg stack. It is
+# outside the Python-wheel and /usr/local cleanup above, so remove the complete
+# set of FFmpeg packages after that cleanup rather than only libx264/libx265:
+# on arm64 the residual libavutil/libpostproc/libsw* libraries are independently
+# caught by the media-codec policy. Querying dpkg keeps this valid across the
+# base image's architecture/version suffixes and intentionally avoids
+# autoremove: its dependency graph includes the runtime JIT toolchain and CUDA
+# math libraries.
+RUN set -eux; \
+    purge="$(dpkg-query -W -f='${Package}\n' 2>/dev/null \
+        | grep -E '^(ffmpeg|libav[a-z]|libsw[a-z]|libpostproc|libx264|libx265|libmp3lame|libaom|libdav1d|libvpx|libtheora|libvorbis|libopus|libsoxr|libcaca|libcdio|libzvbi|libgme|libvidstab|libdc1394|libraw1394|libiec61883|libtwolame|libshine|libsrt[0-9]|libudfread|libsvtav1|libbs2b|librubberband|libchromaprint|libcodec2|libgsm|libass[0-9]|libbluray|libxvidcore|libflite)' \
+        || true)"; \
+    if [ -n "$purge" ]; then \
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y $purge; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig
+
+{% if context.get(framework, {}).get(device_key, {}).get("prune_dev_dsv41_packages", "false") == "true" %}
+# dev-dsv41 is a SGLang development image, not a redistributable serving
+# runtime. Remove its measured build, debug, desktop, and MPI-development
+# payload so this day-0 image is governed by the normal license policy instead
+# of an exception. The package list is pinned in the build context, filtered to
+# what the current architecture actually has installed, and deliberately avoids
+# autoremove so JIT/CUDA dependencies cannot be swept as incidental orphans.
+RUN --mount=type=bind,source=./container/deps/sglang/dev-dsv41-nonruntime-packages.txt,target=/tmp/dev-dsv41-nonruntime-packages.txt,readonly \
+    set -eux; \
+    purge=""; \
+    while IFS= read -r package; do \
+        case "$package" in ""|\#*) continue ;; esac; \
+        if [ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" = "installed" ]; then \
+            purge="$purge $package"; \
+        fi; \
+    done < /tmp/dev-dsv41-nonruntime-packages.txt; \
+    if [ -n "$purge" ]; then \
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y --no-auto-remove $purge; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig
+{% endif %}
 {% endif %}
 
 # Drop the Nsight efa_metrics plugin the CUDA floor carries: a Go NIC sampler
