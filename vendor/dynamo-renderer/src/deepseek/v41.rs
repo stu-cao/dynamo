@@ -11,6 +11,35 @@ use super::v4::{Encoding, encode_messages_with_encoding};
 
 const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
 
+/// Env var selecting the thinking mode for a request that names neither a thinking
+/// flag nor a reasoning effort. Unset keeps the template's own default (thinking).
+/// `false`/`0`/`off`/`chat` serve such requests in chat mode, so a deployment can
+/// default reasoning off without a gateway rewriting every request. Any explicit
+/// control still wins: a thinking flag, or an effort (other than `none`, which
+/// already means chat) turns thinking on.
+pub const DEFAULT_THINKING_ENV: &str = "DYN_DEEPSEEK_V41_DEFAULT_THINKING";
+
+fn parse_default_thinking(value: Option<&str>) -> ThinkingMode {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "false" | "0" | "off" | "no" | "chat") => ThinkingMode::Chat,
+        _ => ThinkingMode::Thinking,
+    }
+}
+
+fn configured_default_thinking() -> ThinkingMode {
+    static MODE: std::sync::OnceLock<ThinkingMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_default_thinking(std::env::var(DEFAULT_THINKING_ENV).ok().as_deref()))
+}
+
+/// Mode used when the request carries no thinking flag: an explicit effort means
+/// the caller asked for reasoning; silence takes the deployment default.
+fn silent_default_mode(effort: Option<&Value>, configured: ThinkingMode) -> ThinkingMode {
+    match effort {
+        None | Some(Value::Null) => configured,
+        Some(_) => ThinkingMode::Thinking,
+    }
+}
+
 fn validate_text(text: &str) -> Result<&str> {
     ensure!(
         !text.contains(IMAGE_PLACEHOLDER),
@@ -308,7 +337,10 @@ impl crate::OAIPromptFormatter for DeepSeekV41Formatter {
             .map(|value| serde_json::to_value(value).context("Serialize reasoning effort"))
             .transpose()?
             .or_else(|| args.and_then(|args| args.get("reasoning_effort").cloned()));
-        let mut thinking_mode = resolve_thinking_mode(args, ThinkingMode::Thinking);
+        let mut thinking_mode = resolve_thinking_mode(
+            args,
+            silent_default_mode(effort.as_ref(), configured_default_thinking()),
+        );
         let budget = match effort.as_ref() {
             None | Some(Value::Null) => 75,
             Some(value) => match value.as_str() {
@@ -361,5 +393,38 @@ impl crate::OAIPromptFormatter for DeepSeekV41Formatter {
             }
         }
         encode_messages(&messages, thinking_mode, drop_thinking, budget)
+    }
+}
+
+#[cfg(test)]
+mod default_thinking_tests {
+    use super::*;
+
+    #[test]
+    fn unset_or_unknown_keeps_thinking() {
+        assert_eq!(parse_default_thinking(None), ThinkingMode::Thinking);
+        assert_eq!(parse_default_thinking(Some("true")), ThinkingMode::Thinking);
+        assert_eq!(parse_default_thinking(Some("yes please")), ThinkingMode::Thinking);
+    }
+
+    #[test]
+    fn off_values_select_chat() {
+        for value in ["false", "0", "off", "no", "chat", " FALSE "] {
+            assert_eq!(parse_default_thinking(Some(value)), ThinkingMode::Chat, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_effort_overrides_an_off_default() {
+        let high = Value::String("high".into());
+        assert_eq!(silent_default_mode(Some(&high), ThinkingMode::Chat), ThinkingMode::Thinking);
+        assert_eq!(silent_default_mode(Some(&Value::from(60)), ThinkingMode::Chat), ThinkingMode::Thinking);
+    }
+
+    #[test]
+    fn silence_takes_the_configured_default() {
+        assert_eq!(silent_default_mode(None, ThinkingMode::Chat), ThinkingMode::Chat);
+        assert_eq!(silent_default_mode(Some(&Value::Null), ThinkingMode::Chat), ThinkingMode::Chat);
+        assert_eq!(silent_default_mode(None, ThinkingMode::Thinking), ThinkingMode::Thinking);
     }
 }
