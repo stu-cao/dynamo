@@ -1,0 +1,83 @@
+name: Prime Python Wheel
+
+# Python-only follow-ups reuse the verified Rust runtime instead of rebuilding it.
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  wheel:
+    runs-on: image-builder
+    timeout-minutes: 15
+    env:
+      BASE_REF: 8ce4970f9f8497085bb0d2274f0fe56f8ecdc4fc
+      BASE_RELEASE: wheels-1.5.0.dev20260910-prime.g8ce4970f9f
+      RUNTIME_VERSION: 1.5.0.dev20260910+prime.g8ce4970f9f
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - name: Verify native source is unchanged
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          git diff --exit-code "$BASE_REF" -- lib vendor Cargo.toml Cargo.lock
+      - name: Stamp Python package and pin existing runtime
+        run: |
+          python - <<'PY'
+          import os, re
+          from pathlib import Path
+          version = '1.5.0.dev20261013+prime.v41image.g' + os.environ['GITHUB_SHA'][:10]
+          path = Path('pyproject.toml')
+          source = path.read_text()
+          source, count = re.subn(r'^version = "[^"]+"', f'version = "{version}"', source, count=1, flags=re.M)
+          assert count == 1
+          source, count = re.subn(r'ai-dynamo-runtime==[^"\s]+', 'ai-dynamo-runtime==' + os.environ['RUNTIME_VERSION'], source, count=1)
+          assert count == 1
+          path.write_text(source)
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'WHEEL_VERSION={version}\nRELEASE_TAG=wheels-{version.replace("+", "-")}\n')
+          PY
+      - name: Build Python wheel
+        run: uv build --wheel --out-dir dist .
+      - name: Reuse verified native wheels
+        run: |
+          gh release download "$BASE_RELEASE" --dir baseline \
+            --pattern 'ai_dynamo_runtime-*.whl' --pattern 'gpu_memory_service-*.whl' \
+            --pattern SHA256SUMS
+          (cd baseline && sha256sum --ignore-missing -c SHA256SUMS)
+          cp baseline/*.whl dist/
+          (cd dist && sha256sum *.whl > SHA256SUMS-amd64)
+      - name: Record provenance
+        run: |
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          wheels = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('dist').glob('*.whl')}
+          manifest = {'python_source': os.environ['GITHUB_SHA'], 'python_version': os.environ['WHEEL_VERSION'],
+                      'runtime_source': os.environ['BASE_REF'], 'runtime_version': os.environ['RUNTIME_VERSION'],
+                      'native_source_unchanged': True, 'wheels': wheels}
+          Path('dist/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-and-runtime-amd64
+          path: dist/
+      - name: Publish release
+        run: |
+          cat > release-notes.txt <<EOF
+          Python worker fix: retain image data and original image placeholders on non-Qwen decode workers. This preserves image-specific prefix-cache keys and vision embeddings when decode recomputes a partial transferred KV block.
+
+          Python source: $GITHUB_SHA
+          Rust runtime reused unchanged from $BASE_REF; this job verifies the native source diff and original wheel checksums.
+          Runtime version: $RUNTIME_VERSION
+          Build: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --prerelease \
+            --title "DeepSeek V4.1 image handoff: $WHEEL_VERSION" \
+            --notes-file release-notes.txt dist/*

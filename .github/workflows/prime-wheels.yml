@@ -10,6 +10,11 @@ name: Prime Wheels
 on:
   workflow_dispatch:
     inputs:
+      python_only:
+        description: 'Build only ai-dynamo, reusing the verified V4.1 Rust runtime'
+        type: boolean
+        required: false
+        default: false
       version_suffix:
         description: >-
           PEP 440 suffix override. Leave EMPTY (recommended): the suffix is then
@@ -55,11 +60,15 @@ permissions:
   contents: write
 
 jobs:
+  python_wheel:
+    if: ${{ inputs.python_only }}
+    uses: ./.github/workflows/prime-python-wheel.yml
   # Emits the build matrix as JSON. A `matrix.exclude` cannot be used to filter
   # an include-only matrix -- exclude is applied to the base combinations, and
   # with no base keys it resolved to zero jobs. Building the list here is the
   # supported way to make the arch set dynamic.
   matrix:
+    if: ${{ !inputs.python_only }}
     name: resolve matrix
     runs-on: ubuntu-latest
     outputs:

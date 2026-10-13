@@ -569,9 +569,11 @@ class VllmMultimodalRequestProcessor:
                         # Keep UUID-only slots as bare None so cache misses fail
                         # before model-specific vision processing.
                         chunks = [
-                            None
-                            if image is None
-                            else {"type": "image", "image": image, "uuid": None}
+                            (
+                                None
+                                if image is None
+                                else {"type": "image", "image": image, "uuid": None}
+                            )
                             for image in images
                         ]
                         vllm_mm_data[image_key] = (
@@ -860,21 +862,30 @@ class VllmMultimodalRequestProcessor:
                         "embedding metadata (image_grid_thw) for Qwen-VL decode"
                     )
                     raise MissingMultimodalHandoffError(message)
-            elif embedding_params and embedding_params.get("expanded_prompt_token_ids"):
+            elif (
+                not has_mm_data
+                and embedding_params
+                and embedding_params.get("expanded_prompt_token_ids")
+            ):
                 request_for_prompt["token_ids"] = embedding_params[
                     "expanded_prompt_token_ids"
                 ]
-                has_mm_data = False
 
-            # Video/audio media is loaded again on decode because the handoff
-            # currently carries image metadata only. For mixed requests, merge
-            # it with the reconstructed Qwen image placeholder.
+            # Qwen reconstructs image features from its model-specific handoff.
+            # Other models must process the original images and unexpanded
+            # prompt again: expanded token IDs alone lose image cache hashes
+            # and the embeddings needed to recompute a partial transferred KV
+            # block. Keep video/audio alongside the image features in either
+            # case.
             if has_mm_data:
                 mm_map = request["multi_modal_data"]
+                local_modalities = (
+                    (VIDEO_URL_KEY, AUDIO_URL_KEY)
+                    if self._model_family is ModelFamily.QWEN_VL
+                    else (IMAGE_URL_KEY, VIDEO_URL_KEY, AUDIO_URL_KEY)
+                )
                 local_mm_map = {
-                    key: mm_map[key]
-                    for key in (VIDEO_URL_KEY, AUDIO_URL_KEY)
-                    if mm_map.get(key)
+                    key: mm_map[key] for key in local_modalities if mm_map.get(key)
                 }
                 if local_mm_map:
                     local_request = dict(request)

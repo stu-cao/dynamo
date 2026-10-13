@@ -1097,14 +1097,51 @@ async def test_qwen_decode_merges_placeholder_image_with_reloaded_video(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_non_qwen_decode_uses_expanded_prompt_tokens():
-    processor = _processor(model="llava-hf/llava-1.5-7b-hf")
+@pytest.mark.parametrize(
+    "model", ["deepseek-ai/DeepSeek-V4.1-Flash", "llava-hf/llava-1.5-7b-hf"]
+)
+async def test_non_qwen_decode_preserves_image_cache_identity(model):
+    processor = _processor(model=model)
+    image = Image.new("RGB", (4, 4), "red")
+    processor.image_loader.load_image_batch.return_value = [image]
+    request = {
+        "token_ids": [1, 99, 2],
+        "multi_modal_data": {"image_url": [{"Url": "https://image"}]},
+        "prefill_result": {
+            "disaggregated_params": {
+                "embedding_params": {"expanded_prompt_token_ids": [1, 99, 99, 2]}
+            }
+        },
+    }
+    prefill = await _prepare_prompt(
+        processor, request, "request-prefill", None, DisaggregationMode.PREFILL
+    )
+    decode = await _prepare_prompt(
+        processor, request, "request-decode", None, DisaggregationMode.DECODE
+    )
 
+    # Token-only expanded prompts lose the image hash in vLLM's prefix cache
+    # and omit embeddings when decode recomputes a partial transferred block.
+    assert decode.prompt["prompt_token_ids"] == [1, 99, 2]
+    assert decode.prompt["multi_modal_data"] == {"image": image}
+    assert decode.prompt["multi_modal_uuids"] == prefill.prompt["multi_modal_uuids"]
+
+    processor.image_loader.load_image_batch.return_value = [
+        Image.new("RGB", (4, 4), "blue")
+    ]
+    other = await _prepare_prompt(
+        processor, request, "request-other-image", None, DisaggregationMode.DECODE
+    )
+    assert other.prompt["multi_modal_uuids"] != decode.prompt["multi_modal_uuids"]
+
+
+@pytest.mark.asyncio
+async def test_non_qwen_decode_retains_expanded_handoff_without_media():
+    processor = _processor(model="llava-hf/llava-1.5-7b-hf")
     prepared = await _prepare_prompt(
         processor,
         {
             "token_ids": [1, 2],
-            "multi_modal_data": {"image_url": [{"Url": "https://image"}]},
             "prefill_result": {
                 "disaggregated_params": {
                     "embedding_params": {"expanded_prompt_token_ids": [1, 99, 99, 2]}
