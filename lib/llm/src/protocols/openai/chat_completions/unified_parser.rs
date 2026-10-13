@@ -572,7 +572,8 @@ pub(crate) struct ChoiceState {
     opened_calls: HashSet<usize>,
     /// Whether any tool-call chunk was emitted; flips a terminal `Stop` to `ToolCalls`.
     tool_emitted: bool,
-    /// Parsing failed; the stream adapter selects recovery or a terminal error.
+    /// The parser errored. Later chunks pass through as plain text instead of failing
+    /// the request — a parser bug must not turn a served answer into a 500.
     failed: bool,
 }
 
@@ -634,7 +635,7 @@ impl ChoiceState {
                 tracing::warn!(
                     error = %error,
                     family = self.family,
-                    "unified parser push failed"
+                    "unified parser push failed; falling back to plain text for this choice"
                 );
                 output.events.extend(self.give_up(text));
                 output.events
@@ -655,7 +656,7 @@ impl ChoiceState {
                 tracing::warn!(
                     error = %error,
                     family = self.family,
-                    "unified parser finish failed"
+                    "unified parser finish failed; recovering buffered text"
                 );
                 self.give_up("")
             }
@@ -1128,12 +1129,7 @@ where
                 // A usage-only chunk. OpenAI stream ordering requires every choice's
                 // terminal finish_reason to precede it, so flush first.
                 if let Some(template) = &template {
-                    let choices = finish_unterminated_choices(&mut states, &mut records);
-                    if family == DEEPSEEK_V41_UNIFIED_FAMILY && states.values().any(|state| state.failed) {
-                        yield Annotated::from_error("DeepSeek V4.1 output parsing failed");
-                        return;
-                    }
-                    for choice in choices {
+                    for choice in finish_unterminated_choices(&mut states, &mut records) {
                         yield response_with_choice(template, choice);
                     }
                 }
@@ -1186,10 +1182,6 @@ where
                                 original.finish_reason
                             };
                         let deltas = state.finish();
-                        if family == DEEPSEEK_V41_UNIFIED_FAMILY && state.failed {
-                            yield Annotated::from_error("DeepSeek V4.1 output parsing failed");
-                            return;
-                        }
                         emitted.extend(state.choices_for(
                             &empty_choice(original.index),
                             deltas,
@@ -1276,10 +1268,6 @@ where
                     records.entry(original.index).or_default().finished = true;
                 }
 
-                if family == DEEPSEEK_V41_UNIFIED_FAMILY && state.failed {
-                    yield Annotated::from_error("DeepSeek V4.1 output parsing failed");
-                    return;
-                }
                 let mut parsed = state.choices_for(&original, deltas, true, terminal);
                 if parsed.is_empty() {
                     // A marker-only chunk produced no deltas. Keep it as an empty
@@ -1325,12 +1313,7 @@ where
 
         // Backstop: the stream ended without a terminating chunk for some choice.
         if let Some(template) = &template {
-            let choices = finish_unterminated_choices(&mut states, &mut records);
-            if family == DEEPSEEK_V41_UNIFIED_FAMILY && states.values().any(|state| state.failed) {
-                yield Annotated::from_error("DeepSeek V4.1 output parsing failed");
-                return;
-            }
-            for choice in choices {
+            for choice in finish_unterminated_choices(&mut states, &mut records) {
                 yield response_with_choice(template, choice);
             }
         }
@@ -1591,7 +1574,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepseek_v41_rejects_malformed_closed_arguments() {
+    async fn deepseek_v41_complete_call_survives_missing_outer_closer() {
+        // Model the frontend hiding an EOS token that is also the outer DSML
+        // closer. A complete invocation is committed at `</｜DSML｜ invoke>`, so
+        // removing only `</｜DSML｜ calls>` must not drop the call.
+        let input = concat!(
+            "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke>"
+        );
+
+        let batch = parse_complete(
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+            input,
+            &GuidedToolConstraint::None,
+            &weather_tools(),
+        )
+        .unwrap();
+        assert_eq!(batch.tool_calls.len(), 1);
+        assert_eq!(batch.tool_calls[0].function.name, "get_weather");
+        assert_eq!(
+            batch.tool_calls[0].function.arguments,
+            r#"{"city":"Tokyo"}"#
+        );
+
+        let responses = apply_stream(
+            stream::iter([chunk(input, true)]),
+            Some(weather_tools()),
+            None,
+            false,
+            UnifiedParserStartingState::Response,
+            DEEPSEEK_V41_UNIFIED_FAMILY,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(responses.iter().all(|response| !response.is_error()));
+        assert_eq!(
+            logical_events(&responses),
+            vec![LogicalEvent::Tool {
+                index: 0,
+                name: Some("get_weather".to_string()),
+                arguments: r#"{"city":"Tokyo"}"#.to_string(),
+            }]
+        );
+        assert_eq!(
+            collect_choices(&responses).last().unwrap().finish_reason,
+            Some(FinishReason::ToolCalls)
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_v41_recovers_malformed_closed_arguments_as_text() {
         let text = concat!(
             "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
             "<｜DSML｜ parameter name=\"count\" string=\"false\">not-json</｜DSML｜ parameter>",
@@ -1607,9 +1640,15 @@ mod tests {
         )
         .collect::<Vec<_>>()
         .await;
-        assert!(responses.iter().any(Annotated::is_error));
-        assert!(logical_events(&responses).is_empty());
-        assert!(collect_choices(&responses).is_empty());
+        assert!(responses.iter().all(|response| !response.is_error()));
+        assert_eq!(
+            logical_events(&responses),
+            vec![LogicalEvent::Text(text.to_string())]
+        );
+        assert_eq!(
+            collect_choices(&responses).last().unwrap().finish_reason,
+            Some(FinishReason::Stop)
+        );
     }
 
     #[tokio::test]

@@ -582,19 +582,9 @@ impl DeltaAggregator {
                             }
                         }
                     }
-                    Err(error) if family == super::unified_parser::DEEPSEEK_V41_UNIFIED_FAMILY => {
-                        // DeepSeek's streaming path terminates on the same parser
-                        // failure. Preserve stream/batch parity instead of serving
-                        // malformed DSML as a successful assistant message.
-                        return Err(DynamoError::msg(format!(
-                            "DeepSeek V4.1 output parsing failed: {error}"
-                        )));
-                    }
                     Err(error) => {
                         // Best-effort: the aggregated text is served as-is rather than
-                        // failing a request the model already answered. DeepSeek is
-                        // intentionally excluded above because malformed arguments are
-                        // part of that parser's public error contract.
+                        // failing a request the model already answered.
                         suppress_incomplete_structured_content(
                             choice,
                             family,
@@ -2659,14 +2649,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepseek_v41_batch_rejects_malformed_closed_arguments() {
+    async fn deepseek_v41_batch_recovers_malformed_closed_arguments_as_text() {
+        let text = concat!(
+            "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
+            "<｜DSML｜ parameter name=\"count\" string=\"false\">not-json</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke></｜DSML｜ calls>"
+        );
         let annotated_delta = create_test_delta(
             0,
-            concat!(
-                "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">",
-                "<｜DSML｜ parameter name=\"count\" string=\"false\">not-json</｜DSML｜ parameter>",
-                "</｜DSML｜ invoke></｜DSML｜ calls>"
-            ),
+            text,
             Some(dynamo_protocols::types::Role::Assistant),
             Some(dynamo_protocols::types::FinishReason::Stop),
             None,
@@ -2683,10 +2674,13 @@ mod tests {
         )
         .await;
 
-        assert!(
-            result.is_err(),
-            "malformed DeepSeek V4.1 output must not be served as successful raw DSML"
+        let response = result.expect("malformed parser output should fall back to text");
+        let choice = &response.inner.choices[0];
+        assert_eq!(
+            choice.message.content,
+            Some(ChatCompletionMessageContent::Text(text.to_string()))
         );
+        assert!(choice.message.tool_calls.is_none());
     }
 
     #[tokio::test]
