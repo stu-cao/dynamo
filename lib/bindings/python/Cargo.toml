@@ -144,3 +144,4 @@ strip = false
 dynamo-parsers = { path = "../../../vendor/dynamo-parsers" }
 
 dynamo-parsers-v2 = { path = "../../../vendor/dynamo-parsers-v2" }
+dynamo-renderer = { path = "../../../vendor/dynamo-renderer" }

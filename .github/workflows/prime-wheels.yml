@@ -91,6 +91,12 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
     steps:
+      - name: Report builder resources
+        run: |
+          echo "Available build CPUs: $(nproc)"
+          free -h
+          df -h /
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/share/swift 2>/dev/null || true

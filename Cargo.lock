@@ -2896,8 +2896,6 @@ dependencies = [
 [[package]]
 name = "dynamo-renderer"
 version = "5.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4609cdbd65f8bd15c74f4531c1560d04496e8737dfb6b65b45487644b878963"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2908,6 +2906,7 @@ dependencies = [
  "minijinja-contrib",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 

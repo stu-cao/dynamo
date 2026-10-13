@@ -3037,6 +3037,20 @@ impl OpenAIPreprocessor {
         request: &R,
     ) -> Result<Option<RenderedPrompt>> {
         let continue_final = request.get_continue_final_message() == Some(true);
+        if continue_final
+            && self
+                .formatter
+                .media_message_order(request)
+                .is_some_and(|order| {
+                    order
+                        .last()
+                        .is_some_and(|&source| source != order.len() - 1)
+                })
+        {
+            return Err(invalid_argument_error(
+                "Cannot continue the final message because the prompt formatter moves it before other messages",
+            ));
+        }
         let formatted_prompt = if self.normalize_tool_call_args || continue_final {
             self.apply_template_inner(&NormalizedArgsRequest {
                 inner: request,
@@ -3233,7 +3247,11 @@ impl OpenAIPreprocessor {
         };
         let has_media_loader = self.media_loader.is_some();
 
-        for message in messages.iter() {
+        // DeepSeek V4.1 renders tool results in call order. Collect payloads and
+        // cache identities in that same order so each placeholder gets its image.
+        let message_order = self.formatter.media_message_order(request);
+        for index in 0..messages.len() {
+            let message = &messages[message_order.as_ref().map_or(index, |order| order[index])];
             let Some(content_parts) = multimodal_content_parts(message) else {
                 continue;
             };

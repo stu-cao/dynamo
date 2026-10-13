@@ -37,6 +37,7 @@ areas:
   - lib/llm/src/protocols/openai/
   - lib/llm/tests/test_reasoning_parser.rs
   - lib/llm/tests/test_streaming_tool_parsers.rs
+  - vendor/dynamo-renderer/
   - tests/frontend/
   - tests/frontend/grpc/
 - label: agents
