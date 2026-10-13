@@ -542,9 +542,8 @@ pub(crate) fn fanout_llm_metrics_position(choices: &[ChatChoiceStream]) -> Optio
 /// An empty streaming choice for `index`, used as the base every emitted chunk is
 /// filled in from.
 ///
-/// `logprobs` is dropped on purpose: once parsing rewrites a choice, the emitted text
-/// no longer lines up token-for-token with the backend's raw stream, so per-token
-/// logprobs would be attached to the wrong characters.
+/// It carries no `logprobs`: `ChoiceState::choices_for` moves a source chunk's
+/// logprobs onto the first choice emitted for it (see there).
 pub(crate) fn empty_choice(index: u32) -> ChatChoiceStream {
     #[allow(deprecated)]
     ChatChoiceStream {
@@ -716,6 +715,13 @@ impl ChoiceState {
     /// `role` / `refusal` ride on the first emitted choice and the terminating
     /// `finish_reason` on the last, so a client that reassembles the stream sees the
     /// same envelope it would have without this path.
+    ///
+    /// The source chunk's `logprobs` ride on the first emitted choice too. Parsing
+    /// regroups text (a held-back marker can surface a chunk later, one chunk can fan
+    /// out into reasoning + text), so a chunk's text and its token logprobs need not
+    /// sit on the same emitted chunk. Every token's logprobs still reach the client
+    /// exactly once and in order, which is the OpenAI contract, and the vLLM
+    /// OpenAI server does the same when a reasoning parser splits a chunk.
     pub(crate) fn choices_for(
         &mut self,
         original: &ChatChoiceStream,
@@ -793,6 +799,9 @@ impl ChoiceState {
             choices.push(choice);
         }
 
+        if let Some(first) = choices.first_mut() {
+            first.logprobs = original.logprobs.clone();
+        }
         choices
     }
 
@@ -1272,8 +1281,11 @@ where
                 if parsed.is_empty() {
                     // A marker-only chunk produced no deltas. Keep it as an empty
                     // choice so the typed llm_metrics and annotation metadata it
-                    // carries still reach the client.
-                    parsed.push(empty_choice(original.index));
+                    // carries still reach the client, along with the logprobs of
+                    // the tokens it held back.
+                    let mut held = empty_choice(original.index);
+                    held.logprobs = original.logprobs.clone();
+                    parsed.push(held);
                 }
                 emitted.extend(parsed);
             }
@@ -1325,7 +1337,8 @@ mod tests {
     use super::*;
     use dynamo_parsers_v2::ToolCallDelta;
     use dynamo_protocols::types::{
-        ChatCompletionStreamResponseDeltaFunctionCall, CreateChatCompletionStreamResponse, Role,
+        ChatChoiceLogprobs, ChatCompletionStreamResponseDeltaFunctionCall,
+        ChatCompletionTokenLogprob, CreateChatCompletionStreamResponse, Role,
     };
     use futures::stream;
 
@@ -2148,6 +2161,106 @@ mod tests {
     }
 
     // --- end-to-end streaming ----------------------------------------------------
+
+    fn token_logprobs(tokens: &[&str]) -> ChatChoiceLogprobs {
+        ChatChoiceLogprobs {
+            content: Some(
+                tokens
+                    .iter()
+                    .map(|token| ChatCompletionTokenLogprob {
+                        token: token.to_string(),
+                        logprob: -0.5,
+                        token_id: None,
+                        bytes: None,
+                        top_logprobs: vec![],
+                    })
+                    .collect(),
+            ),
+            refusal: None,
+        }
+    }
+
+    fn emitted_tokens<'a>(choices: impl IntoIterator<Item = &'a ChatChoiceStream>) -> Vec<String> {
+        choices
+            .into_iter()
+            .filter_map(|choice| choice.logprobs.as_ref()?.content.as_ref())
+            .flatten()
+            .map(|entry| entry.token.clone())
+            .collect()
+    }
+
+    #[test]
+    fn source_logprobs_ride_on_the_first_fanned_out_choice() {
+        let mut state = test_state();
+        let mut base = empty_choice(0);
+        base.logprobs = Some(token_logprobs(&["a", "b"]));
+        let choices = state.choices_for(
+            &base,
+            vec![
+                UnifiedParserEvent::Reasoning("think".into()),
+                UnifiedParserEvent::Text("answer".into()),
+            ],
+            true,
+            None,
+        );
+
+        assert_eq!(choices.len(), 2, "{choices:?}");
+        assert_eq!(choices[0].logprobs, base.logprobs);
+        assert_eq!(choices[1].logprobs, None, "a chunk's logprobs go out exactly once");
+    }
+
+    #[test]
+    fn envelope_only_choice_keeps_source_logprobs() {
+        let mut state = test_state();
+        let mut base = empty_choice(0);
+        base.delta.role = Some(Role::Assistant);
+        base.logprobs = Some(token_logprobs(&["<think>"]));
+        let choices = state.choices_for(&base, Vec::new(), true, None);
+
+        assert_eq!(choices.len(), 1, "{choices:?}");
+        assert_eq!(choices[0].logprobs, base.logprobs);
+    }
+
+    #[tokio::test]
+    async fn every_source_token_logprob_reaches_the_client_once_in_order() {
+        let output = concat!(
+            "<think>reason</think>answer ",
+            "<tool_call>\n<function=get_weather>\n",
+            "<parameter=city>Tokyo</parameter>\n</function>\n</tool_call>"
+        );
+        // One "token" per 3-byte piece, so markers straddle chunks and some chunks
+        // are held back entirely while the parser waits for the rest of a marker.
+        let pieces: Vec<&str> = output
+            .as_bytes()
+            .chunks(3)
+            .map(|bytes| std::str::from_utf8(bytes).unwrap())
+            .collect();
+        let mut chunks: Vec<_> = pieces
+            .iter()
+            .map(|piece| {
+                let mut annotated = chunk(piece, false);
+                annotated.data.as_mut().unwrap().inner.choices[0].logprobs =
+                    Some(token_logprobs(&[piece]));
+                annotated
+            })
+            .collect();
+        chunks.push(chunk("", true));
+
+        let responses = apply_stream(
+            stream::iter(chunks),
+            Some(weather_tools()),
+            None,
+            false,
+            UnifiedParserStartingState::None,
+            QWEN3_UNIFIED_FAMILY,
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let choices = collect_choices(&responses);
+        let expected: Vec<String> = pieces.iter().map(|piece| piece.to_string()).collect();
+        assert_eq!(emitted_tokens(choices.iter().copied()), expected);
+    }
 
     #[tokio::test]
     async fn streams_ordered_reasoning_text_and_tool_calls() {
