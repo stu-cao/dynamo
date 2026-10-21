@@ -212,6 +212,49 @@ async fn reconcile_approximate_lru_snapshot(
     Ok(())
 }
 
+/// How often the KV router repeats its "still waiting for workers" line while
+/// startup is blocked below `min_initial_workers`.
+const INITIAL_WORKER_WAIT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Block until `workers` holds at least `min_initial_workers` entries.
+///
+/// Semantics are unchanged from the `wait_for` this replaces: no timeout, and a
+/// closed watch is still an error. What is new is visibility. Waiting silently
+/// made a `--router-min-initial-workers` above the real worker count
+/// indistinguishable from a slow start — the frontend simply never registered
+/// the model, and the log said nothing about why. Log the shortfall
+/// immediately, on every membership change, and every
+/// [`INITIAL_WORKER_WAIT_LOG_INTERVAL`] while the count is stuck.
+async fn wait_for_initial_workers(
+    workers: &mut RuntimeConfigWatch,
+    min_initial_workers: usize,
+    component: &dynamo_runtime::component::Component,
+    model_name: Option<&str>,
+) -> Result<()> {
+    loop {
+        let have = workers.borrow().len();
+        if have >= min_initial_workers {
+            return Ok(());
+        }
+        tracing::info!(
+            component = %component,
+            model = model_name.unwrap_or_default(),
+            waiting_for = min_initial_workers,
+            have,
+            "KV router waiting for initial workers"
+        );
+        match tokio::time::timeout(INITIAL_WORKER_WAIT_LOG_INTERVAL, workers.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => anyhow::bail!(
+                "runtime config watch closed before {} workers appeared",
+                min_initial_workers
+            ),
+            // Timed out with no membership change: loop and log again.
+            Err(_) => {}
+        }
+    }
+}
+
 fn start_approximate_lru_reconciler(
     indexer: Indexer,
     mut workers: RuntimeConfigWatch,
@@ -728,15 +771,13 @@ where
 
         if min_initial_workers > 0 && !kv_router_config.skip_initial_worker_wait {
             let mut startup_watch = workers_with_configs.clone();
-            let _ = startup_watch
-                .wait_for(|m| m.len() >= min_initial_workers)
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "runtime config watch closed before {} workers appeared",
-                        min_initial_workers
-                    )
-                })?;
+            wait_for_initial_workers(
+                &mut startup_watch,
+                min_initial_workers,
+                component,
+                model_name.as_deref(),
+            )
+            .await?;
         }
 
         let approximate_lru_ranks = Arc::new(parking_lot::Mutex::new(

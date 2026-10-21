@@ -1046,6 +1046,10 @@ where
             model_name: card.name().to_string(),
             worker_set_key: worker_set_key(&endpoint_id, card.model_type, card.worker_type),
         };
+        // Publish the announced name before the group can commit. A request
+        // that arrives while a P/D group is still incomplete is a transient
+        // deployment state (503), not an unknown model (404).
+        self.manager.note_known_model(&group_key.model_name);
         let mdc_checksum = card.mdcsum().to_string();
         let projection_fingerprint = lora_projection_fingerprint(&card)?;
         Ok(Some(DesiredInstance {
@@ -1217,6 +1221,9 @@ where
             members = removed_members,
             "Removed discovered model group"
         );
+        // Nothing announces this name any more: drop it so requests go back to
+        // a 404 route miss instead of a permanent "not ready" 503.
+        self.manager.forget_known_model_if_gone(&key.model_name);
     }
 
     fn discard_prepared(&self, prepared: Self::Prepared) {

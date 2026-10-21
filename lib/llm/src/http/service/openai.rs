@@ -3881,9 +3881,11 @@ pub(crate) fn model_not_ready_message(model_name: &str) -> String {
 /// namespace.
 ///
 /// Returns `503 Service Unavailable` with a structured body when the model
-/// isn't ready to serve. Models absent from the committed catalog, including
-/// discovered models still being built, fall through here; the per-handler
-/// engine lookup later in the request path returns a 404 instead.
+/// isn't ready to serve. Models absent from the committed catalog fall through
+/// here — including a discovered model whose disaggregated group has not
+/// committed yet — and the engine lookup later in the request path makes the
+/// final call: a known name is `ModelUnavailable` (503), and only a name this
+/// frontend has never seen is a 404.
 pub(crate) fn check_model_serving_ready(
     state: &Arc<service_v2::State>,
     model_name: &str,
@@ -7667,6 +7669,76 @@ mod tests {
         // two paths cannot drift apart.
         let gate = ErrorMessage::service_unavailable_with_body(model_not_ready_message("my-model"));
         assert_eq!(gate.1.message, backstop.1.message);
+    }
+
+    /// `POST /v1/chat/completions` answers 503 (retryable) for a model the
+    /// frontend knows but cannot serve yet, and keeps 404 for a model it has
+    /// never heard of. The 2026-10-05 P/D outage served 404 for 29 minutes
+    /// because a partially-registered group never committed; gateways score a
+    /// 404 as neutral, so failover never fired.
+    #[tokio::test]
+    async fn chat_completions_known_model_503_unknown_model_404() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let service = crate::http::service::service_v2::HttpService::builder()
+            .port(port)
+            .enable_chat_endpoints(true)
+            .build()
+            .expect("build http service");
+        // A worker card announced this model, but its discovery group never
+        // committed: the partially-registered P/D state.
+        service.state().manager().note_known_model("pending-model");
+        let cancel = dynamo_runtime::CancellationToken::new();
+        let handle = tokio::spawn(async move {
+            service.run_with_listener(cancel, listener).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let request = |model: &'static str| {
+            format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}],"max_tokens":1}}"#
+            )
+        };
+        let client = reqwest::Client::new();
+        let url = format!("http://localhost:{port}/v1/chat/completions");
+
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(request("pending-model"))
+            .send()
+            .await
+            .expect("chat completions request");
+        assert_eq!(
+            response.status().as_u16(),
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        );
+        // The OpenAI paths answer with a bare `ErrorMessage`, not the
+        // `{"error": {...}}` envelope the engine-native generate route uses.
+        let body: serde_json::Value = response.json().await.expect("json body");
+        assert_eq!(body["code"], 503);
+        assert_eq!(body["type"], "Service Unavailable");
+        assert!(
+            body["message"].as_str().is_some_and(
+                |message| message.contains("pending-model") && message.contains("retry")
+            ),
+            "not-ready body must name the model and signal retryability: {body}"
+        );
+
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(request("never-configured"))
+            .send()
+            .await
+            .expect("chat completions request");
+        assert_eq!(response.status().as_u16(), StatusCode::NOT_FOUND.as_u16());
+        let body: serde_json::Value = response.json().await.expect("json body");
+        assert_eq!(body["code"], 404);
+
+        handle.abort();
     }
 
     #[test]

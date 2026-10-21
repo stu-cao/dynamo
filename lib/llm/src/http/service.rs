@@ -13,8 +13,10 @@
 //! This enables use to handle only 1 pattern of request-response in the downstream services. Non-streaming user requests are
 //! aggregated by the HttpService and returned as a single response.
 //!
-//! TODO(): Add support for model-specific metadata and status. Status will allow us to return a 503 when the model is supposed
-//! to be ready, but there is a problem with the model.
+//! Model-specific status: a model the frontend knows about but cannot serve yet
+//! (a partially-registered prefill/decode group, or a worker that has not
+//! activated its router) returns a retryable 503 rather than a 404. A 404 is
+//! reserved for a model name the frontend has never seen.
 //!
 //! The [`service_v2::HttpService`] can be further extended to host any [`axum::Router`] using the [`service_v2::HttpServiceConfigBuilder`].
 

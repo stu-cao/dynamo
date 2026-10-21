@@ -10,7 +10,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use dashmap::{DashMap, mapref::entry::Entry};
+use dashmap::{DashMap, DashSet, mapref::entry::Entry};
 use dynamo_kv_router::{
     PrefillLoadEstimator,
     config::KvRouterConfig,
@@ -167,6 +167,16 @@ pub struct ModelManager {
     /// Per-instance model cards, keyed by instance path. Used for cleanup on worker removal.
     cards: DashMap<String, Arc<ModelDeploymentCard>>,
 
+    /// Model names a worker card has announced, whether or not the discovery
+    /// group they belong to has committed yet.
+    ///
+    /// A disaggregated group only commits once every role is present, so a
+    /// configured model can be known to the frontend long before it has a
+    /// committed [`Model`]. Keeping the announced names here is what lets the
+    /// request path answer 503 ("not ready yet") instead of 404 ("no such
+    /// model") while prefill or decode is still starting.
+    known_models: DashSet<String>,
+
     /// Controller-owned committed groups, keyed by the controller's stable GroupKey encoding.
     discovery_groups: DashMap<String, CommittedDiscoveryGroup>,
 
@@ -218,6 +228,7 @@ impl ModelManager {
             models: DashMap::new(),
             catalog: ArcSwap::from_pointee(CommittedCatalog::default()),
             cards: DashMap::new(),
+            known_models: DashSet::new(),
             discovery_groups: DashMap::new(),
             runtime_configs: DashMap::new(),
             hicache_caches: DashMap::new(),
@@ -1020,6 +1031,62 @@ impl ModelManager {
         self.catalog.load().models.contains_key(model)
     }
 
+    /// Record that a worker card announced `model_name`.
+    ///
+    /// Called for every discovered instance before its discovery group
+    /// commits, so the name is known while a disaggregated group is still
+    /// waiting for a role to join. See [`Self::is_model_known`].
+    pub(crate) fn note_known_model(&self, model_name: &str) {
+        self.known_models.insert(model_name.to_string());
+    }
+
+    /// Drop `model_name` from the announced-name set once nothing announces it
+    /// any more: no live model and no committed discovery group.
+    ///
+    /// Keeps the "known model" window bounded by the deployment's lifetime, so
+    /// a decommissioned model reverts to a 404 rather than staying a permanent
+    /// "not ready" 503.
+    pub(crate) fn forget_known_model_if_gone(&self, model_name: &str) {
+        if self.models.contains_key(model_name) {
+            return;
+        }
+        if self
+            .discovery_groups
+            .iter()
+            .any(|group| group.value().primary == model_name)
+        {
+            return;
+        }
+        self.known_models.remove(model_name);
+    }
+
+    /// Whether this frontend has any record of `model_name`: a live model, a
+    /// committed one, or a card from a discovery group that has not committed
+    /// yet.
+    ///
+    /// This is the "configured / known" edge that separates a client error
+    /// (asking for a model this frontend has never heard of) from a transient
+    /// deployment state (a model that is configured but not serving yet).
+    pub fn is_model_known(&self, model_name: &str) -> bool {
+        self.models.contains_key(model_name)
+            || self.catalog.load().models.contains_key(model_name)
+            || self.known_models.contains(model_name)
+    }
+
+    /// Error for a request naming a model that is absent from the committed
+    /// catalog.
+    ///
+    /// A name this frontend knows about is a deployment that has not finished
+    /// starting: `ModelUnavailable`, which the HTTP layer maps to a retryable
+    /// 503. Anything else is a genuine route miss: `ModelNotFound` → 404.
+    fn model_lookup_error(&self, model_name: &str) -> ModelManagerError {
+        if self.is_model_known(model_name) {
+            ModelManagerError::ModelUnavailable(model_name.to_string())
+        } else {
+            ModelManagerError::ModelNotFound(model_name.to_string())
+        }
+    }
+
     /// Resolve the model name to use in frontend Prometheus metrics.
     ///
     /// Returns the user-supplied name if a model is registered under it
@@ -1260,7 +1327,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_embeddings_engine()
     }
 
@@ -1272,7 +1339,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_classify_engine()
     }
 
@@ -1284,7 +1351,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_pooling_engine()
     }
 
@@ -1296,7 +1363,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_completions_engine()
     }
 
@@ -1308,7 +1375,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_chat_engine()
     }
 
@@ -1320,7 +1387,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_tensor_engine()
     }
 
@@ -1332,7 +1399,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_images_engine()
     }
 
@@ -1344,7 +1411,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_videos_engine()
     }
 
@@ -1356,7 +1423,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_audios_engine()
     }
 
@@ -1368,7 +1435,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_realtime_engine()
     }
 
@@ -1380,7 +1447,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_generate_engine()
     }
     /// Get a Generate engine for `model` from a worker advertising `capability`.
@@ -1393,7 +1460,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_generate_engine_for_capability(capability)
     }
 
@@ -1408,7 +1475,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_generate_engine_for_capability_with_routing(capability)
     }
 
@@ -1428,7 +1495,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_chat_engine_with_parsing()
     }
 
@@ -1446,7 +1513,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_completions_engine_with_parsing()
     }
 
@@ -1464,7 +1531,7 @@ impl ModelManager {
             .load()
             .models
             .get(model)
-            .ok_or_else(|| ModelManagerError::ModelNotFound(model.to_string()))?
+            .ok_or_else(|| self.model_lookup_error(model))?
             .get_generate_engine_with_parsing()
     }
 
@@ -3957,6 +4024,51 @@ mod tests {
             ),
             "incomplete-but-engine-present model must be ModelUnavailable (503), not 404"
         );
+    }
+
+    /// A model whose worker card was announced but whose discovery group never
+    /// committed (a P/D group missing a role) is a deployment that has not
+    /// finished starting, so the engine getter must say `ModelUnavailable`
+    /// (503). Only names this frontend has never seen are 404s — the frontend's
+    /// circuit breaker and its clients treat those very differently.
+    #[test]
+    fn announced_but_uncommitted_model_is_unavailable_not_not_found() {
+        let mm = ModelManager::new();
+
+        // The card arrived; the group could not commit, so there is no Model.
+        mm.note_known_model("pending-glm");
+        assert!(mm.is_model_known("pending-glm"));
+        assert!(matches!(
+            mm.get_chat_completions_engine("pending-glm"),
+            Err(ModelManagerError::ModelUnavailable(_))
+        ));
+
+        // Never announced anywhere: still a genuine route miss.
+        assert!(!mm.is_model_known("nobody-serves-this"));
+        assert!(matches!(
+            mm.get_chat_completions_engine("nobody-serves-this"),
+            Err(ModelManagerError::ModelNotFound(_))
+        ));
+    }
+
+    /// Once the deployment is gone, the name stops being "known", so requests
+    /// revert to a 404 instead of a permanent 503.
+    #[test]
+    fn forgotten_model_reverts_to_not_found() {
+        let mm = ModelManager::new();
+        mm.note_known_model("decommissioned");
+        assert!(matches!(
+            mm.get_chat_completions_engine("decommissioned"),
+            Err(ModelManagerError::ModelUnavailable(_))
+        ));
+
+        mm.forget_known_model_if_gone("decommissioned");
+
+        assert!(!mm.is_model_known("decommissioned"));
+        assert!(matches!(
+            mm.get_chat_completions_engine("decommissioned"),
+            Err(ModelManagerError::ModelNotFound(_))
+        ));
     }
 
     struct UncalledEngine;
