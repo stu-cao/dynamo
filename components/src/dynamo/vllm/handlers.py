@@ -842,6 +842,22 @@ def build_sampling_params(
         sampling_params.logprobs = logprobs
     if prompt_logprobs is not None:
         sampling_params.prompt_logprobs = prompt_logprobs
+        # prompt_logprobs is assigned after SamplingParams construction, so
+        # vLLM's __post_init__ default for skip_reading_prefix_cache (which
+        # keys off prompt_logprobs) never fires. Prefix-cache reads would then
+        # skip the forward pass for cached prompt tokens and return logprobs
+        # for a suffix only -- worst under P/D, where the decode worker reuses
+        # the prefill KV and scores just its replay window. Force it here, as
+        # upstream does (ai-dynamo/dynamo#14398); an explicit setting wins.
+        explicit_cache_setting = sampling_options.get(
+            "skip_reading_prefix_cache",
+            extra_args.get("skip_reading_prefix_cache")
+            if isinstance(extra_args, dict)
+            else None,
+        )
+        sampling_params.skip_reading_prefix_cache = (
+            True if explicit_cache_setting is None else explicit_cache_setting
+        )
 
     # skip_special_tokens is intentionally NOT forwarded to vLLM here: this path
     # forces detokenize=False (below), so vLLM never detokenizes and ignores it.
